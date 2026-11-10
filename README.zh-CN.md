@@ -6,15 +6,15 @@ Pi 的跨会话记忆扩展。让 Agent 保存和查找可复用的经验，并�
 
 ## 试用
 
-需要 Node.js 22.19 或更新版本。已验证的开发环境为 Pi 1.5.0、Node.js 24、macOS。
+需要 Pi、Git 和 Node.js 22.19 或更新版本。已验证的开发环境为 Pi 1.5.0、Node.js 24、macOS。
 
-在你要工作的项目目录中运行，把扩展路径换成本项目的绝对路径：
+在你要工作的项目目录中运行，Pi 会从 GitHub 下载扩展，不用手动克隆仓库：
 
 ```bash
-pi -e /absolute/path/to/pi-memory --pi-memory-no-dream
+pi -e git:github.com/ttttmr/pi-memory --pi-memory-no-dream
 ```
 
-这只为当前进程加载扩展，不修改 Pi 设置。这里先关闭自动后台整理，避免试用时产生额外的整理请求；普通对话和 `/memory` 仍使用你的 Pi 模型与凭证。
+这只为当前进程加载扩展，不会把它加入 Pi 设置，但会保留本地包缓存。这里先关闭自动后台整理，避免试用时产生额外的整理请求；普通对话和 `/memory` 仍使用你的 Pi 模型与凭证。
 
 想让 Agent 记住一件事时，直接输入：
 
@@ -32,23 +32,33 @@ pi -e /absolute/path/to/pi-memory --pi-memory-no-dream
 
 Agent 在普通工作中也可自主记录值得保留的经验，不保证聊过的所有内容都会保存。需要保留时可以明确要求，并让 Agent 读取已保存内容确认；不能只凭一句“记住了”判断文件已经落盘。
 
-## 安装与移除
+## 安装、更新与移除
 
-需要长期启用时，使用本地项目路径安装：
+需要长期启用时，从 GitHub 安装：
 
 ```bash
-pi install /absolute/path/to/pi-memory
+pi install git:github.com/ttttmr/pi-memory
 ```
 
-安装会修改个人 Pi 设置。不要把 npm 上的同名包当成本项目。
+安装会把包加入个人 Pi 设置。之后在要工作的项目目录中运行 `pi`，便可在会话内使用 `/memory`。若要保持关闭自动后台整理，用 `pi --pi-memory-no-dream` 启动。
+
+更新这个包：
+
+```bash
+pi update git:github.com/ttttmr/pi-memory
+```
+
+更新后重启 Pi，或在现有会话中运行 `/reload` 加载新代码。
 
 移除扩展：
 
 ```bash
-pi remove /absolute/path/to/pi-memory
+pi remove git:github.com/ttttmr/pi-memory
 ```
 
-移除不会删除记忆文件。
+移除不会删除记忆文件。不要把 npm 上的同名包当成本项目。
+
+本地开发仍可用 `pi -e /absolute/path/to/pi-memory` 加载仓库副本。
 
 ## 控制自动召回和后台整理
 
@@ -59,8 +69,7 @@ pi remove /absolute/path/to/pi-memory
 分别关闭两项功能：
 
 ```bash
-pi -e /absolute/path/to/pi-memory \
-  --pi-memory-no-recall --pi-memory-no-dream
+pi --pi-memory-no-recall --pi-memory-no-dream
 ```
 
 启动参数控制当前运行实例，不持久保存。需要恢复某项功能时，重新启动 Pi 并去掉对应的关闭参数。没有运行时开关或手动整理命令。
@@ -75,7 +84,7 @@ pi -e /absolute/path/to/pi-memory \
 
 ```bash
 PI_MEMORY_DIR=/absolute/path/to/memory \
-  pi -e /absolute/path/to/pi-memory --pi-memory-no-dream
+  pi --pi-memory-no-dream
 ```
 
 记录项目细节时使用项目记忆；只有真正跨项目、非私密的知识才适合放进全局。可以用自然语言告诉 Agent 保存到哪个范围。
@@ -88,7 +97,7 @@ PI_MEMORY_DIR=/absolute/path/to/memory \
 
 | 现象 | 检查与处理 |
 | --- | --- |
-| 找不到 `/memory` 或三个工具 | 检查是否加载本项目的绝对路径，避免另一扩展注册同名命令或工具 |
+| 找不到 `/memory` 或三个工具 | 检查是否加载了 GitHub 包或本地仓库副本，避免另一扩展注册同名命令或工具 |
 | 没有保存笔记 | 用 `/memory` 明确要求保留，再让 Agent 读取已保存内容确认；后台也可从历史工作中创建笔记，但不保证每段对话都会被保存 |
 | print 模式下非空 `/memory` 立即退出 | 请在交互式 Pi 会话内使用 `/memory`。Pi 1.5.0 的 `pi -p '/memory …'` 可能过早释放命令另行生成的请求，不作为受支持的保存方式 |
 | 项目记忆要求信任 | 先审核项目，再按 Pi 流程授权，不盲目信任陌生项目 |

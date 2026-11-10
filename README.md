@@ -6,15 +6,15 @@ A cross-session memory extension for Pi. Agents can save and retrieve reusable k
 
 ## Try it
 
-Requires Node.js 22.19 or later. The verified development environment is Pi 1.5.0, Node.js 24, and macOS.
+Requires Pi, Git, and Node.js 22.19 or later. The verified development environment is Pi 1.5.0, Node.js 24, and macOS.
 
-Run this from the project you want to work on, replacing the extension path with this project's absolute path:
+Run this from the project you want to work on. Pi downloads the extension from GitHub; no manual clone is needed:
 
 ```bash
-pi -e /absolute/path/to/pi-memory --pi-memory-no-dream
+pi -e git:github.com/ttttmr/pi-memory --pi-memory-no-dream
 ```
 
-This loads the extension for the current process without changing Pi settings. Automatic background maintenance is disabled for this first run to avoid extra maintenance requests. Ordinary conversation and `/memory` still use your Pi model and credentials.
+This loads the extension for the current process without adding it to Pi settings. Pi keeps a local package cache. Automatic background maintenance is disabled for this first run to avoid extra maintenance requests. Ordinary conversation and `/memory` still use your Pi model and credentials.
 
 To ask the agent to remember something, enter:
 
@@ -32,23 +32,33 @@ The three model tools are `memory_search`, `memory_read`, and `memory_write`. Yo
 
 Agents can also save useful knowledge during ordinary work. Not everything discussed is guaranteed to be saved. When retention matters, ask explicitly and have the agent read back the saved content. A reply saying "I'll remember" does not prove that a file was written.
 
-## Install and remove
+## Install, update, and remove
 
-For regular use, install from the local project path:
-
-```bash
-pi install /absolute/path/to/pi-memory
-```
-
-Installation changes your personal Pi settings. Do not assume that a package with the same name on npm is this project.
-
-To remove the extension:
+For regular use, install from GitHub:
 
 ```bash
-pi remove /absolute/path/to/pi-memory
+pi install git:github.com/ttttmr/pi-memory
 ```
 
-Removal does not delete memory files.
+Installation adds the package to your personal Pi settings. Then run `pi` from the project you want to work on and use `/memory` in the session. To keep automatic background maintenance disabled, start with `pi --pi-memory-no-dream`.
+
+Update this package:
+
+```bash
+pi update git:github.com/ttttmr/pi-memory
+```
+
+Restart Pi or run `/reload` in an existing session to load updated code.
+
+Remove the extension:
+
+```bash
+pi remove git:github.com/ttttmr/pi-memory
+```
+
+Removal does not delete memory files. Do not assume that a package with the same name on npm is this project.
+
+For local development, you can still load a checkout with `pi -e /absolute/path/to/pi-memory`.
 
 ## Control automatic recall and background maintenance
 
@@ -59,8 +69,7 @@ Background maintenance uses the current model and **makes extra requests that ma
 To disable both features:
 
 ```bash
-pi -e /absolute/path/to/pi-memory \
-  --pi-memory-no-recall --pi-memory-no-dream
+pi --pi-memory-no-recall --pi-memory-no-dream
 ```
 
 Startup flags apply to the current running instance and are not saved. Restart Pi without the corresponding disable flag to restore a feature. There are no runtime toggle or manual maintenance commands.
@@ -75,7 +84,7 @@ The default root is usually `~/.pi/agent/pi-memory`, specifically `pi-memory/` u
 
 ```bash
 PI_MEMORY_DIR=/absolute/path/to/memory \
-  pi -e /absolute/path/to/pi-memory --pi-memory-no-dream
+  pi --pi-memory-no-dream
 ```
 
 Use project memory for project details. Global memory is only for knowledge that is genuinely useful across projects and nonprivate. Tell the agent which scope you intend in natural language.
@@ -88,7 +97,7 @@ Before backing up, stop every Pi session that could write to the memory store. C
 
 | Symptom | Check or action |
 | --- | --- |
-| `/memory` or the three tools are missing | Check that this project's absolute path is loaded and that another extension is not registering the same command or tools. |
+| `/memory` or the three tools are missing | Check that the GitHub package or local checkout is loaded and that another extension is not registering the same command or tools. |
 | No note was saved | Ask explicitly with `/memory`, then have the agent read back the saved content. Background maintenance can also create notes from past work, but not every conversation is guaranteed to be retained. |
 | A nonempty `/memory` exits immediately in print mode | Use `/memory` inside an interactive Pi session. Pi 1.5.0 can dispose the command-generated request too early with `pi -p '/memory …'`; this one-shot form is not a supported save path. |
 | Project memory requires trust | Review the project first, then authorize it through Pi. Do not blindly trust an unfamiliar project. |
