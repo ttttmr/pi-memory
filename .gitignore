@@ -1,0 +1,12 @@
+node_modules/
+*.tgz
+
+# Local verification artifacts and machine-specific secrets
+.local/
+.env
+.env.*
+!.env.example
+.DS_Store
+
+# Third-party research snapshot; preserve locally, do not redistribute
+/references/components-of-agent-memory/

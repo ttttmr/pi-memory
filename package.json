@@ -1,0 +1,44 @@
+{
+  "name": "pi-memory",
+  "version": "0.1.0",
+  "description": "Autonomous Markdown memory and bounded dreaming for Pi",
+  "type": "module",
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "keywords": [
+    "pi-package",
+    "pi",
+    "memory"
+  ],
+  "files": [
+    "src/**/*.ts",
+    "!src/**/*.test.ts",
+    "README.md",
+    "README.zh-CN.md",
+    "AGENTS.md",
+    "docs/**/*.md",
+    "LICENSE"
+  ],
+  "pi": {
+    "extensions": [
+      "./src/memory-extension.ts"
+    ]
+  },
+  "scripts": {
+    "test": "node --experimental-strip-types --test src/*.test.ts",
+    "typecheck": "tsc --noEmit",
+    "check": "npm run typecheck && npm test"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "1.5.0",
+    "typebox": "1.3.27",
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.3"
+  },
+  "license": "MIT"
+}
