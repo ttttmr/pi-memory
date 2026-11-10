@@ -76,7 +76,7 @@ Startup flags apply to the current running instance and are not saved. Restart P
 
 Disabling recall does not disable maintenance or prevent the agent from explicitly reading and writing memory. Pending interactions are still counted while automatic maintenance is disabled and can be processed after it is enabled again.
 
-New input, the start of a foreground run, session or tree changes, and exiting Pi cancel active maintenance. File updates that have already completed are not rolled back.
+You can keep chatting, navigate the session tree, or switch sessions while maintenance runs. The background Agent continues working on its original project; new completed interactions remain pending for later passes. Quitting Pi or explicitly reloading extensions cancels maintenance. File updates that have already completed are not rolled back.
 
 ## Storage and backups
 

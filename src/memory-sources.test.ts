@@ -145,6 +145,27 @@ test("current native file cannot bypass omissions on the live current branch", a
   await assert.rejects(provider.read("current:a:0"), /unavailable/);
 });
 
+test("current source snapshot survives appends, edits and session replacement without retaining the manager", async (t) => {
+  const f = await fixture(t);
+  const entries = [message("a", null, "captured evidence"), edit("redact", "a", "a", { content: "visible replacement" })];
+  const current = currentSession(f.project, entries);
+  const provider = createMemorySourceProvider({ project: f.project, sessionRoots: [f.sessions], currentSession: current });
+  entries[0].message = { role: "user", content: "MUTATED_CANARY" };
+  entries[1].replacement = { content: "LATER_EDIT_CANARY" };
+  entries.push(message("later", "redact", "LATER_MESSAGE_CANARY"));
+  await f.native("current", entries);
+  // Pi retires session-bound accessors; source reads must not call any of them after capture.
+  for (const name of ["getCwd", "getSessionId", "getEntries", "getBranch"] as const) {
+    current[name] = () => { throw new Error("Retired session manager accessed"); };
+  }
+  const result = await provider.search("");
+  assert.deepEqual(result.sources.map((source) => source.id), ["current:a:0"]);
+  assert.equal((await provider.read("current:a:0")).text, "visible replacement");
+  assert.equal((await provider.read("current:a:0")).contextEdited, true);
+  await assert.rejects(provider.read("current:later:0"), /unavailable/);
+  assert.equal((await provider.search("CANARY")).sources.length, 0);
+});
+
 test("visible text allowlist never touches thinking, signatures, images, custom/system, or memory-tool results", async (t) => {
   const f = await fixture(t);
   const forbidden = { type: "thinking", get thinking() { throw new Error("thinking inspected"); },

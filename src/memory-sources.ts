@@ -20,7 +20,7 @@ const SOURCE_SCAN_DEFERRED = Symbol("Memory source scan budget deferred");
 type ReadonlySessionManager = ExtensionContext["sessionManager"];
 type JsonRecord = Record<string, unknown>;
 interface SourceEntry { id: string; parentId: string | null; timestamp: string; type: string; value: JsonRecord; sourceLine?: number }
-interface SourceSession { id: string; entries: SourceEntry[]; branch?: SourceEntry[]; sourceFile?: string }
+interface SourceSession { id: string; entries: SourceEntry[]; branch?: SourceEntry[]; sourceFile?: string; capturedSources?: (MemorySourceMetadata & { text: string })[] }
 interface SourceCandidate { path?: string; current?: true }
 interface SourceScanBudget { remaining: number }
 type SourceLoadResult = SourceSession | null | typeof SOURCE_SCAN_DEFERRED;
@@ -64,7 +64,7 @@ export interface MemorySourceProvider {
   read(id: string, options?: { startCharacter?: number }, signal?: AbortSignal): Promise<MemorySourcePage>;
 }
 
-/** Factory does no I/O; roots must come from the host, never model-supplied file paths. */
+/** Factory captures only visible current-branch text in memory; native files remain read on demand from host roots. */
 export function createMemorySourceProvider(options: {
   project: string;
   sessionRoots: string[];
@@ -72,7 +72,12 @@ export function createMemorySourceProvider(options: {
 }): MemorySourceProvider {
   const roots = [...options.sessionRoots];
   const project = options.project;
-  const current = options.currentSession;
+  const currentCwd = options.currentSession.getCwd();
+  const currentSessionId = options.currentSession.getSessionId();
+  // Project the branch synchronously, before a foreground append, tree change, or runtime teardown.
+  // Retain text and provenance only, not thinking, images, or a copied native transcript.
+  const branch = parseSourceEntries(options.currentSession.getBranch());
+  const capturedSources = visibleSessionSources({ id: currentSessionId, entries: branch, branch });
 
   async function checkProject(signal?: AbortSignal): Promise<void> {
     signal?.throwIfAborted();
@@ -82,11 +87,8 @@ export function createMemorySourceProvider(options: {
   }
 
   async function currentSources(signal?: AbortSignal): Promise<SourceSession | null> {
-    if (!await matchesSourceProject(current.getCwd(), project, signal)) return null;
-    const entries = parseSourceEntries(current.getEntries());
-    const byId = new Map(entries.map((entry) => [entry.id, entry]));
-    const branch = current.getBranch().map((entry) => byId.get(entry.id)).filter((entry) => entry !== undefined);
-    return { id: current.getSessionId(), entries, branch };
+    if (!await matchesSourceProject(currentCwd, project, signal)) return null;
+    return { id: currentSessionId, entries: [], capturedSources };
   }
 
   async function candidates(warnings: Set<string>, signal?: AbortSignal): Promise<SourceCandidate[]> {
@@ -191,7 +193,7 @@ export function createMemorySourceProvider(options: {
           break;
         }
         if (!session || (input.sessionId && session.id !== input.sessionId)) continue;
-        if (!files[fileIndex]!.current && session.id === current.getSessionId()) continue;
+        if (!files[fileIndex]!.current && session.id === currentSessionId) continue;
         let visible: ReturnType<typeof visibleSessionSources>;
         try { visible = visibleSessionSources(session); }
         catch (error) {
@@ -240,7 +242,7 @@ export function createMemorySourceProvider(options: {
             warnings.add(error instanceof Error ? error.message : "Memory source file unavailable");
             return null;
           });
-        if (!session || session === SOURCE_SCAN_DEFERRED || session.id !== sessionId || (!candidate.current && session.id === current.getSessionId())) continue;
+        if (!session || session === SOURCE_SCAN_DEFERRED || session.id !== sessionId || (!candidate.current && session.id === currentSessionId)) continue;
         let visible: ReturnType<typeof visibleSessionSources>;
         try { visible = visibleSessionSources(session); }
         catch (error) {
@@ -387,6 +389,7 @@ function visibleSourceText(content: unknown): string {
 }
 
 function visibleSessionSources(session: SourceSession): (MemorySourceMetadata & { text: string })[] {
+  if (session.capturedSources) return session.capturedSources;
   let branch = session.branch;
   if (!branch) {
     const byId = new Map(session.entries.map((entry) => [entry.id, entry]));

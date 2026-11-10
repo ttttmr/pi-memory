@@ -27,10 +27,14 @@ async function createExtensionHarness(
   if (!existing) await mkdir(cwd);
   const root = existing?.root ?? join(directory, "memory");
   const previousRoot = process.env.PI_MEMORY_DIR;
+  const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+  process.env.PI_CODING_AGENT_DIR = join(directory, "isolated-agent");
   process.env.PI_MEMORY_DIR = root;
   testCtx.after(() => {
     if (previousRoot === undefined) delete process.env.PI_MEMORY_DIR;
     else process.env.PI_MEMORY_DIR = previousRoot;
+    if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
   });
   const handlers = new Map<string, MockHandler>();
   const tools = new Map<string, ToolDefinition>();
@@ -83,6 +87,12 @@ async function createExtensionHarness(
       await handlers.get(name)?.(payload, ctx);
     },
   };
+}
+
+function dreamBarrier() {
+  let resolve!: () => void;
+  const promise = new Promise<void>((done) => { resolve = done; });
+  return { promise, resolve };
 }
 
 function resultValue(result: Awaited<ReturnType<ToolDefinition["execute"]>>) {
@@ -192,7 +202,7 @@ test("same-process parallel tool writes use Pi queue without losing files", asyn
   assert.equal((await listMemoryNotes(h.handle)).length, 8);
 });
 
-test("dreaming uses independent project-only tools after 8 settled runs, and can be cancelled", async (testCtx) => {
+test("dreaming uses independent project-only tools after 8 settled runs, and quit cancels it", async (testCtx) => {
   let runs = 0;
   let started!: () => void;
   const didStart = new Promise<void>((resolve) => { started = resolve; });
@@ -207,8 +217,8 @@ test("dreaming uses independent project-only tools after 8 settled runs, and can
   for (let index = 0; index < 8; index++) await h.event("agent_settled");
   await didStart;
   assert.equal(runs, 1);
-  await h.event("input");
-  assert.match(h.notices.at(-1)!, /cancelled/);
+  await h.event("session_shutdown", false, { reason: "quit" });
+  assert.match(h.notices.at(-1)!, /cancelled by shutdown or extension reload/);
   assert.equal((await readMemorySchedule(h.handle)).pendingTurns, 8, "Cancellation does not acknowledge pending experiences");
 });
 
@@ -267,22 +277,144 @@ test("large escaped search results preserve valid JSON and explicitly mark dropp
   assert.ok(Buffer.byteLength(JSON.stringify(raw.content)) < 100000);
 });
 
-test("tree, fork, switch and extension-triggered foreground starts cancel active dreaming", async (testCtx) => {
-  let started!: () => void;
+test("foreground input, runs and tree navigation leave active dreaming independent", { timeout: 5000 }, async (testCtx) => {
+  const started = dreamBarrier();
+  const release = dreamBarrier();
+  let signal!: AbortSignal;
   const h = await createExtensionHarness(testCtx, async (options) => {
-    started();
-    await new Promise<void>((_resolve, reject) => { options.signal!.addEventListener("abort", () => reject(options.signal!.reason), { once: true }); });
-    return "unreachable";
+    signal = options.signal!;
+    signal.addEventListener("abort", release.resolve, { once: true });
+    started.resolve();
+    await release.promise;
+    return "Completed independently";
   });
-  for (let index = 0; index < 7; index++) await h.event("agent_settled");
-  for (const event of ["session_before_tree", "session_before_fork", "session_before_switch", "agent_start"]) {
-    const didStart = new Promise<void>((resolve) => { started = resolve; });
-    await h.event("agent_settled");
-    await didStart;
+  testCtx.after(() => release.resolve());
+  for (let index = 0; index < 8; index++) await h.event("agent_settled");
+  await started.promise;
+  for (const event of ["input", "agent_start", "session_before_tree", "session_before_fork", "session_before_switch"]) {
     await h.event(event);
-    assert.match(h.notices.at(-1)!, /cancelled/, event);
+    assert.equal(signal.aborted, false, event);
   }
+  const finished = h.waitForDream();
+  release.resolve();
+  await finished;
+  assert.match(h.notices.at(-1)!, /Completed independently/);
+  assert.equal(h.notices.some((notice) => notice.includes("cancelled")), false);
+  assert.equal((await readMemorySchedule(h.handle)).pendingTurns, 0);
 });
+
+for (const reason of ["new", "resume", "fork"]) {
+  test(`active dreaming survives ${reason} runtime replacement without using retired context`, { timeout: 5000 }, async (testCtx) => {
+    const started = dreamBarrier();
+    const release = dreamBarrier();
+    let signal!: AbortSignal;
+    const h = await createExtensionHarness(testCtx, async (options) => {
+      signal = options.signal!;
+      signal.addEventListener("abort", release.resolve, { once: true });
+      started.resolve();
+      await release.promise;
+      const sources = await options.sourceProvider.search("original evidence");
+      assert.equal(sources.sources[0]?.id, "synthetic-session:evidence:0");
+      const writer = options.tools.find((tool) => tool.name === "memory_write")!;
+      const saved = resultValue(await writer.execute("save", { path: "retained.md", content: "Original project finding", expectedHash: null }, signal, undefined));
+      assert.match(saved.sourceHint, /synthetic-session/);
+      const reader = options.tools.find((tool) => tool.name === "memory_read")!;
+      assert.equal(resultValue(await reader.execute("read", { path: "retained.md" }, signal, undefined)).content, "Original project finding");
+      const search = options.tools.find((tool) => tool.name === "memory_search")!;
+      assert.equal(resultValue(await search.execute("search", {}, signal, undefined))[0].path, "retained.md");
+      return "Retained original project";
+    });
+    testCtx.after(() => release.resolve());
+    testCtx.mock.method(h.ctx.sessionManager, "getBranch", () => [{
+      type: "message", id: "evidence", parentId: null, timestamp: "2026-01-01T00:00:00Z",
+      message: { role: "user", content: "original evidence", timestamp: 1 },
+    }]);
+    for (let index = 0; index < 8; index++) await h.event("agent_settled");
+    await started.promise;
+    await h.event("session_shutdown", false, { reason });
+    assert.equal(signal.aborted, false);
+    for (const key of ["cwd", "hasUI", "ui", "sessionManager", "model", "modelRegistry", "isProjectTrusted"]) {
+      Object.defineProperty(h.ctx, key, { configurable: true, get() { throw new Error("Retired Pi context accessed"); } });
+    }
+    const reloaded = await import(new URL(`./memory-extension.ts?dream-replacement-${reason}`, import.meta.url).href);
+    const replacement = await createExtensionHarness(testCtx, async () => { throw new Error("Replacement must not duplicate the active task"); }, [], undefined, undefined, reloaded.default);
+    const finished = replacement.waitForDream();
+    release.resolve();
+    await finished;
+    assert.match(replacement.notices.at(-1)!, /Retained original project/);
+    assert.equal((await readMemoryNote(h.handle, "retained.md"))?.content, "Original project finding");
+    assert.equal(await readMemoryNote(replacement.handle, "retained.md"), null);
+    assert.equal((await readMemorySchedule(h.handle)).pendingTurns, 0);
+  });
+}
+
+for (const succeeds of [true, false]) {
+  test(`new settled work is retained during dreaming; successful completion alone schedules follow-on (${succeeds})`, { timeout: 5000 }, async (testCtx) => {
+    const started = dreamBarrier();
+    const release = dreamBarrier();
+    const secondStarted = dreamBarrier();
+    const secondRelease = dreamBarrier();
+    let runs = 0;
+    const h = await createExtensionHarness(testCtx, async (options) => {
+      options.signal!.addEventListener("abort", () => { release.resolve(); secondRelease.resolve(); }, { once: true });
+      runs++;
+      if (runs === 1) {
+        started.resolve();
+        await release.promise;
+        if (!succeeds) throw new Error("Synthetic model failure");
+      } else {
+        secondStarted.resolve();
+        await secondRelease.promise;
+      }
+      return "Done";
+    });
+    testCtx.after(() => { release.resolve(); secondRelease.resolve(); });
+    for (let index = 0; index < 8; index++) await h.event("agent_settled");
+    await started.promise;
+    for (let index = 0; index < 8; index++) {
+      await h.event("input");
+      await h.event("agent_start");
+      await h.event("agent_settled");
+    }
+    assert.equal(runs, 1);
+    const finished = h.waitForDream();
+    release.resolve();
+    await finished;
+    if (succeeds) {
+      await secondStarted.promise;
+      assert.equal((await readMemorySchedule(h.handle)).pendingTurns, 8);
+      const secondFinished = h.waitForDream();
+      secondRelease.resolve();
+      await secondFinished;
+      assert.equal(runs, 2);
+      assert.equal((await readMemorySchedule(h.handle)).pendingTurns, 0);
+    } else {
+      assert.equal((await readMemorySchedule(h.handle)).pendingTurns, 16);
+      assert.equal(runs, 1, "Failure does not immediately start another paid run");
+      assert.match(h.notices.at(-1)!, /Synthetic model failure/);
+    }
+  });
+}
+
+for (const reason of ["quit", "reload"]) {
+  test(`${reason} in a replacement runtime cancels the surviving task and preserves pending work`, { timeout: 5000 }, async (testCtx) => {
+    const started = dreamBarrier();
+    const h = await createExtensionHarness(testCtx, async (options) => {
+      started.resolve();
+      await new Promise<void>((_resolve, reject) => options.signal!.addEventListener("abort", () => reject(options.signal!.reason), { once: true }));
+      return "unreachable";
+    });
+    for (let index = 0; index < 8; index++) await h.event("agent_settled");
+    await started.promise;
+    await h.event("session_shutdown", false, { reason: "resume" });
+    const replacement = await createExtensionHarness(testCtx, undefined, [], h);
+    await replacement.event("session_shutdown", false, { reason });
+    assert.equal((await readMemorySchedule(h.handle)).pendingTurns, 8);
+    assert.match(replacement.notices.at(-1)!, /cancelled by shutdown or extension reload/);
+    const state = JSON.parse(await readFile(join(h.handle.directory, ".dream-state.json"), "utf8"));
+    assert.equal(state.claim, null, "Cancellation releases the original runtime's lease");
+  });
+}
 
 test("pending experiences survive short sessions and a fresh extension without foreground memory writes", async (testCtx) => {
   let runs = 0;

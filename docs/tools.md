@@ -170,7 +170,7 @@ This does not require manual approval at each step. The Agent may call writing t
 
 ## Internal dreaming source tools
 
-The foreground model still has only the three memory tools above. Independent background dreaming also has `memory_source_search` and `memory_source` for read-only access to same-project Pi native history and the current runtime session. They are not general file, shell, or network tools. They do not accept model-specified file paths, rewrite sessions, or create a separate session-copy index.
+The foreground model still has only the three memory tools above. Independent background dreaming also has `memory_source_search` and `memory_source` for read-only access to same-project Pi native history and the initiating session’s captured visible branch. They are not general file, shell, or network tools. They do not accept model-specified file paths, rewrite sessions, or create a separate session-copy index.
 
 ### memory_source_search
 
@@ -209,7 +209,7 @@ Exact ID reads do not require the source to appear on the previous search page. 
 
 ### Read scope and evidentiary meaning
 
-The session header's actual `cwd` must belong to the current canonical project identity. The current session uses its actual active branch; historical files use the final record's parent-chain branch. Other branches are not read by default. Messages still retained from before compaction are accessible. Messages deleted by `context_edit` are not returned. Replacements return only the replacement text, marked with `contextEdited: true` and `evidence: "context-edited"`. Hashes always cover the complete visible text containing the returned range. Edited content cannot be used to claim verification of the original feedback.
+The session header's actual `cwd` must belong to the current canonical project identity. The initiating session uses the visible active branch captured when the pass starts, including context edits present then; later changes appear in later passes. Historical files are read on demand using the final record's parent-chain branch. Other branches are not read by default. Messages still retained from before compaction are accessible. Messages deleted by `context_edit` are not returned. Replacements return only the replacement text, marked with `contextEdited: true` and `evidence: "context-edited"`. Hashes always cover the complete visible text containing the returned range. Edited content cannot be used to claim verification of the original feedback.
 
 Sources contain only user, assistant, and ordinary tool-result text, excluding this extension's own memory-tool results. Thinking, signatures, images, custom messages, system prompts, and tool-call arguments are not returned. Identical entries copied into forks share a `duplicateKey` and are deduplicated within a search page, but their reappearance across pages still cannot count as independent evidence. User statements, assistant judgments, and tool observations must not be treated as the same kind of proof either.
 

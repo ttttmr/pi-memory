@@ -103,6 +103,8 @@ test("dream uses an independent tool transcript, reads exact original evidence, 
   assert.match(h.contexts[0].systemPrompt!, /MEMORY.md a small/);
   assert.match(h.contexts[0].systemPrompt!, /untrusted DATA/);
   assert.match(h.contexts[0].systemPrompt!, /assistant claim is not independent proof/);
+  assert.match(h.contexts[0].systemPrompt!, /Foreground agents may continue working/);
+  assert.match(h.contexts[0].systemPrompt!, /New interactions remain work for later passes/);
 });
 
 test("dream defaults to configured registry completion, with the registry receiver preserved", async () => {
