@@ -1,6 +1,6 @@
 # pi-memory：维护 Agent 约定
 
-本文件面向修改本项目的 Agent，不是使用说明。安装、命令和排障见 [README.md](README.md)，工具参数见 [docs/tools.md](docs/tools.md)，架构与数据约束见 [docs/design.md](docs/design.md)，测试和人工验收见 [docs/development.md](docs/development.md)。
+本文件面向修改本项目的 Agent，不是使用说明。快速上手见 [README.md](README.md)，详细操作和排障见 [docs/usage.md](docs/usage.md)，工具参数见 [docs/tools.md](docs/tools.md)，架构与数据约束见 [docs/design.md](docs/design.md)，测试和人工验收见 [docs/development.md](docs/development.md)。
 
 ## 项目与入口
 
@@ -89,7 +89,7 @@ npm pack --dry-run
 
 README.md 和 docs/*.md 是完整英文默认版；README.zh-CN.md 和 docs/*.zh-CN.md 是对应的完整简体中文版，不是摘要。更改文档时同步两种语言、顶部语言切换和同语言本地链接；README.zh-CN.md 也须进入分发包。本维护指令只保留一份，不另造重复 AGENTS。
 
-设计参考 Anthropic 的 [The components of agent memory](https://www.anthropic.com/research/components-of-agent-memory)，不声称实现相同或继承其基准收益。文章对齐 review 若本地留有 `references/components-of-agent-memory/`，先读其中 README，校验快照后阅读完整正文，并实际读取原图，不能以 alt 或文件存在代替视觉审阅。该目录不进入 Git，全新克隆不含它；缺失时查阅原始文章并明确证据及读图限制，不宣称已检查缺失快照。区分可组合的层次、模型与任务特定实验、项目实现选择；对应理解统一维护在 docs/design.md，不把实验实例扩成通用功能要求。该第三方图文快照仅供本地维护研究，不进入 Git 或 npm 包。README 只写试用、安装、操作、隐私与排障，不写架构原理；记忆组成、生命周期和设计取舍统一放在 docs/design.md。
+设计参考 Anthropic 的 [The components of agent memory](https://www.anthropic.com/research/components-of-agent-memory)，不声称实现相同或继承其基准收益。文章对齐 review 若本地留有 `references/components-of-agent-memory/`，先读其中 README，校验快照后阅读完整正文，并实际读取原图，不能以 alt 或文件存在代替视觉审阅。该目录不进入 Git，全新克隆不含它；缺失时查阅原始文章并明确证据及读图限制，不宣称已检查缺失快照。区分可组合的层次、模型与任务特定实验、项目实现选择；对应理解统一维护在 docs/design.md，不把实验实例扩成通用功能要求。该第三方图文快照仅供本地维护研究，不进入 Git 或 npm 包。README 保持简短，只写用途、GitHub 安装、/memory 示例、必要的一句操作提醒和文档入口，不写架构原理，不单设费用或隐私提醒章节。临时试用、更新移除、开关、存储备份、隐私与排障放在 docs/usage.md 及其中文版；记忆组成、生命周期和设计取舍统一放在 docs/design.md。
 
 ## 验证与安全边界
 
