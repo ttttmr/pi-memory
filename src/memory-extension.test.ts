@@ -47,7 +47,7 @@ async function createExtensionHarness(
   let dreamFinished: (() => void) | undefined;
   const ctx = {
     cwd, hasUI: true, mode: "print", isProjectTrusted: () => trusted,
-    model: { id: "synthetic-model" }, modelRegistry: {},
+    model: { id: "synthetic-model", maxTokens: 65536 }, modelRegistry: {},
     sessionManager: {
       getSessionId: () => sessionId, getLeafId: () => `synthetic-entry-${leafNumber}`,
       getCwd: () => cwd, getSessionDir: () => join(directory, "isolated-sessions"),

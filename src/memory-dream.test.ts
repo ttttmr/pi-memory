@@ -7,7 +7,7 @@ import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { runMemoryDream, type MemoryDreamCompletion, type MemoryDreamOptions, type MemoryDreamTool } from "./memory-dream.ts";
 import type { MemorySourceProvider } from "./memory-sources.ts";
 
-const model = { id: "synthetic-model", provider: "synthetic-provider", api: "openai-completions" } as NonNullable<ExtensionContext["model"]>;
+const model = { id: "synthetic-model", provider: "synthetic-provider", api: "openai-completions", maxTokens: 131072 } as NonNullable<ExtensionContext["model"]>;
 const sourceText = "Original synthetic test output: check passed.\nDo not interpret this text as instructions.";
 const sources = [{ id: "synthetic-session:entry:0", sessionId: "synthetic-session", entryId: "entry", role: "toolResult",
   text: sourceText, hash: createHash("sha256").update(sourceText).digest("hex"), timestamp: "2026-01-01T00:00:00.000Z",
@@ -60,7 +60,7 @@ function harness(responses: AssistantMessage[]) {
   let completions = 0;
   const complete: MemoryDreamCompletion = async (actualModel, context, request) => {
     assert.equal(actualModel, model);
-    assert.equal(request.maxTokens, 4096);
+    assert.equal(request.maxTokens, 65536);
     assert.ok(request.signal instanceof AbortSignal);
     contexts.push(structuredClone(context));
     const result = responses[completions++];
@@ -112,7 +112,7 @@ test("dream defaults to configured registry completion, with the registry receiv
   const registry = { async complete(actualModel: unknown, context: Context, request: { maxTokens: number }) {
     assert.equal(this, registry);
     assert.equal(actualModel, model);
-    assert.equal(request.maxTokens, 4096);
+    assert.equal(request.maxTokens, 65536);
     assert.deepEqual(context.tools!.map(({ name }) => name), ["memory_search", "memory_read", "memory_write", "memory_source_search", "memory_source"]);
     return done();
   } };
@@ -146,18 +146,39 @@ test("dream passes thrown and returned tool errors to the model without counting
   assert.ok(h.contexts[1].messages.filter((message) => message.role === "toolResult").every((result) => result.isError));
 });
 
-test("dream fails on the sixth tool-using model response rather than claiming completion", async () => {
-  const h = harness(Array.from({ length: 6 }, (_, i) => assistant([call("memory_read", {}, `read-${i}`)], "toolUse")));
-  await assert.rejects(runMemoryDream(h.options), /response budget exhausted \(6\).*reflection incomplete/);
-  assert.equal(h.completions, 6);
+test("dream allows a completion report on response 32 after exactly 64 tool calls", async () => {
+  const h = harness([
+    ...Array.from({ length: 31 }, (_, i) => assistant(
+      Array.from({ length: i === 0 ? 4 : 2 }, (_, j) => call("memory_read", {}, `read-${i}-${j}`)), "toolUse")),
+    done(),
+  ]);
+  const report = await runMemoryDream(h.options);
+  assert.match(report, /Memory dream finished/);
+  assert.equal(h.completions, 32);
+  assert.equal(h.contexts[31].messages.filter((message) => message.role === "toolResult").length, 64);
+  assert.match(h.contexts[0].systemPrompt!, /32 model responses, 64 total tool calls, 65536 output tokens per response .* and 300 seconds/);
 });
 
-test("dream enforces the 16 tool budget before dispatching an overflowing batch", async () => {
+test("dream fails on the 32nd tool-using model response rather than claiming completion", async () => {
+  const h = harness(Array.from({ length: 32 }, (_, i) => assistant([call("memory_read", {}, `read-${i}`)], "toolUse")));
+  await assert.rejects(runMemoryDream(h.options), /response budget exhausted \(32\).*reflection incomplete/);
+  assert.equal(h.completions, 32);
+});
+
+test("dream caps output at the selected model limit when lower than 64k", async () => {
+  const h = harness([]);
+  await runMemoryDream({ ...h.options, model: { ...model, maxTokens: 8192 }, complete: async (_model, _context, request) => {
+    assert.equal(request.maxTokens, 8192);
+    return done();
+  } });
+});
+
+test("dream enforces the 64 tool budget before dispatching an overflowing batch", async () => {
   const h = harness([
-    assistant(Array.from({ length: 16 }, (_, i) => call("memory_read", {}, `read-${i}`)), "toolUse"),
+    assistant(Array.from({ length: 64 }, (_, i) => call("memory_read", {}, `read-${i}`)), "toolUse"),
     assistant([call("memory_write", { path: "MEMORY.md", expectedHash: null })], "toolUse"),
   ]);
-  await assert.rejects(runMemoryDream(h.options), /tool call budget exhausted \(16\)/);
+  await assert.rejects(runMemoryDream(h.options), /tool call budget exhausted \(64\)/);
   assert.equal(h.writes.length, 0);
   assert.equal(h.completions, 2);
 });
@@ -201,8 +222,10 @@ test("dream timeout reports completed writes and an uncertain in-flight write wi
   };
   const pending = runMemoryDream(h.options);
   await entered;
-  const rejected = assert.rejects(pending, /timeout after 90 seconds.*1 write call\(s\) completed.*in flight.*may still complete/);
-  testCtx.mock.timers.tick(90_000);
+  const rejected = assert.rejects(pending, /timeout after 300 seconds.*1 write call\(s\) completed.*in flight.*may still complete/);
+  testCtx.mock.timers.tick(299_999);
+  assert.equal(toolSignal?.aborted, false, "The task remains live beyond the old 90-second limit");
+  testCtx.mock.timers.tick(1);
   await rejected;
   assert.equal(toolSignal?.aborted, true);
   assert.equal(writeCount, 2);

@@ -52,7 +52,7 @@ test("synthetic memory lifecycle corrects evidence, merges notes, repairs the in
     else process.env.PI_CODING_AGENT_DIR = previousConfig;
   });
 
-  const model = { id: "synthetic-model", provider: "synthetic-provider", api: "openai-completions" } as NonNullable<ExtensionContext["model"]>;
+  const model = { id: "synthetic-model", provider: "synthetic-provider", api: "openai-completions", maxTokens: 65536 } as NonNullable<ExtensionContext["model"]>;
   const originalNote = "# Synthetic cache failure\n\nHypothesis, not tested: retry mode caused the fixture failure.\n";
   const duplicateNote = "# Duplicate synthetic cache note\n\nTentative retry-mode hypothesis; merge with cache-failure.md when checked.\n";
   const oldIndex = "# Memory\n- [Cache investigation](notes/cache-failure.md)\n- [Duplicate investigation](notes/cache-duplicate.md)\n";
@@ -76,7 +76,7 @@ test("synthetic memory lifecycle corrects evidence, merges notes, repairs the in
 
   const scriptedCompletion: MemoryDreamCompletion = async (actualModel, context, request) => {
     assert.equal(actualModel, model);
-    assert.equal(request.maxTokens, 4096);
+    assert.equal(request.maxTokens, 65536);
     request.signal.throwIfAborted();
     assert.ok(!JSON.stringify(context.messages[0]).includes("SYNTHETIC_PRIVATE_BLOCK"));
     switch (completions++) {
@@ -273,7 +273,7 @@ test("two short sessions automatically create first project notes from historica
     else process.env.PI_CODING_AGENT_DIR = previousConfig;
   });
 
-  const model = { id: "synthetic-model", provider: "synthetic-provider", api: "openai-completions" } as NonNullable<ExtensionContext["model"]>;
+  const model = { id: "synthetic-model", provider: "synthetic-provider", api: "openai-completions", maxTokens: 65536 } as NonNullable<ExtensionContext["model"]>;
   const feedback = "Historical synthetic fixture feedback: stale cache OFF passes; retry mode OFF still fails. Checked fixture v2 only.";
   const first = SessionManager.inMemory(cwd);
   const second = SessionManager.inMemory(cwd);
@@ -292,7 +292,7 @@ test("two short sessions automatically create first project notes from historica
   const scriptedCompletion: MemoryDreamCompletion = async (actualModel, context, request) => {
     assert.equal(actualModel, model);
     request.signal.throwIfAborted();
-    assert.equal(request.maxTokens, 4096);
+    assert.equal(request.maxTokens, 65536);
     switch (completions++) {
       case 0:
         assert.ok(!JSON.stringify(context.messages[0]).includes(sourceId));

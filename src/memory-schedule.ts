@@ -5,7 +5,8 @@ import {
 } from "./memory-store.ts";
 
 const DREAM_TURN_THRESHOLD = 8;
-const DREAM_LEASE_MILLISECONDS = 120_000;
+// Cover the five-minute dream timeout plus 30 seconds for setup and cleanup.
+const DREAM_LEASE_MILLISECONDS = 330_000;
 const MAX_SCHEDULE_SESSIONS = 1000;
 
 /** Persistent turn counts are project-wide; due means at least eight unprocessed completed turns. */

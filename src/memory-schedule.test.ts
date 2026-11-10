@@ -136,8 +136,10 @@ test("expired logical lease recovers using fake time, but never steals a filesys
   await recordFixtureTurns(handle);
   const original = await claimMemoryDream(handle, { ownerId: "old" });
   assert.ok(original);
-  assert.equal(original.expiresAt, 1_120_000);
-  ctx.mock.timers.tick(119_999);
+  assert.equal(original.expiresAt, 1_330_000);
+  ctx.mock.timers.tick(300_000);
+  assert.equal(await claimMemoryDream(handle, { ownerId: "new" }), null, "Lease covers the entire five-minute dream timeout");
+  ctx.mock.timers.tick(29_999);
   assert.equal(await claimMemoryDream(handle, { ownerId: "new" }), null);
   ctx.mock.timers.tick(1);
   await mkdir(`${handle.directory}.lock`);
