@@ -205,7 +205,7 @@ export default function piMemoryExtension(
         const result = await dreamRunner({ modelRegistry, model, tools, sourceProvider, signal: controller.signal });
         controller.signal.throwIfAborted();
         success = true;
-        showDreamNotice(`Memory dreaming completed.\n${result}`);
+        if (result) showDreamNotice(result);
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         showDreamNotice(`Memory dreaming stopped: ${message}. Completed file writes, if any, remain; this is not an all-or-nothing transaction.`, "warning");

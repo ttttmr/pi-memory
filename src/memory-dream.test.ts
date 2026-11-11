@@ -88,7 +88,7 @@ test("dream uses an independent tool transcript, reads exact original evidence, 
   ], "toolUse"), done()]);
   const progress: string[] = [];
   const report = await runMemoryDream({ ...h.options, onProgress: (text) => progress.push(text) });
-  assert.match(report, /2 write call\(s\) completed/);
+  assert.equal(report, "Memory updated: 2 write call(s) completed.");
   assert.equal(h.writes.length, 2);
   assert.deepEqual(h.contexts[0].messages.map(({ role }) => role), ["user"]);
   const replay = h.contexts[1].messages;
@@ -117,7 +117,7 @@ test("dream defaults to configured registry completion, with the registry receiv
     return done();
   } };
   const report = await runMemoryDream({ ...h.options, complete: undefined, modelRegistry: registry as unknown as ExtensionContext["modelRegistry"] });
-  assert.match(report, /0 write call/);
+  assert.equal(report, "");
 });
 
 test("dream reports unavailable source, unknown tools, schema errors, global scope, and unauthorized actions as tool errors", async () => {
@@ -142,7 +142,7 @@ test("dream passes thrown and returned tool errors to the model without counting
   h.tools[1].execute = async () => { throw new Error("synthetic read conflict"); };
   h.tools[2].execute = async () => textResult("synthetic write conflict", true);
   const report = await runMemoryDream(h.options);
-  assert.match(report, /0 write call/);
+  assert.equal(report, "");
   assert.ok(h.contexts[1].messages.filter((message) => message.role === "toolResult").every((result) => result.isError));
 });
 
@@ -153,7 +153,7 @@ test("dream allows a completion report on response 32 after exactly 64 tool call
     done(),
   ]);
   const report = await runMemoryDream(h.options);
-  assert.match(report, /Memory dream finished/);
+  assert.equal(report, "");
   assert.equal(h.completions, 32);
   assert.equal(h.contexts[31].messages.filter((message) => message.role === "toolResult").length, 64);
   assert.match(h.contexts[0].systemPrompt!, /32 model responses, 64 total tool calls, 65536 output tokens per response .* and 300 seconds/);

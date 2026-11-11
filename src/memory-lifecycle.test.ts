@@ -344,7 +344,7 @@ test("two short sessions automatically create first project notes from historica
       modelRegistry: { complete() { throw new Error("Live provider invocation is forbidden"); } },
       ui: {
         setStatus(_key: string, text: string | undefined) {
-          if (text === undefined && notices.some((notice) => notice.startsWith("Memory dreaming completed."))) finishDream();
+          if (text === undefined && notices.some((notice) => notice.startsWith("Memory updated:"))) finishDream();
         },
         confirm: () => { throw new Error("Synthetic background work must not request approval"); },
         notify(text: string) {

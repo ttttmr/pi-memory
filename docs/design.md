@@ -148,7 +148,7 @@ The background run uses the same model selected when that run starts, calling it
 
 At the start, the background model receives an independent maintenance prompt, without a preloaded source catalog or foreground conversation. It calls `memory_read` to read project `MEMORY.md` and notes, `memory_source_search` to discover same-project historical material, and `memory_source` to read pages of complete visible text by ID. The background run has no foreground automatic index-injection hook and does not load the entire note directory by default.
 
-Tool calls in each model reply pass allowlist, parameter, and scope checks before sequential execution. Results return to this independent conversation before the next model call. The model eventually returns a short report or stops because of errors, budgets, or cancellation. The report appears in a UI notification or terminal output; it is not appended persistently as a new foreground model message.
+Tool calls in each model reply pass allowlist, parameter, and scope checks before sequential execution. Results return to this independent conversation before the next model call. The model eventually returns a short report or stops because of errors, budgets, or cancellation. On success, the host shows only a short confirmed-write count in a UI notification or terminal output; passes with no successful writes stay silent. The model report is not displayed or appended as a foreground message. Failures still produce a warning.
 
 ### Sources span sessions within project, branch, and edit boundaries
 

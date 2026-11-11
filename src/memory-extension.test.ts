@@ -242,6 +242,15 @@ test("successful dreaming may update MEMORY.md itself, without scheduling itself
   assert.equal((await readMemorySchedule(h.handle)).pendingTurns, 6);
 });
 
+test("no-change dreaming stays silent and acknowledges pending work", async (testCtx) => {
+  const h = await createExtensionHarness(testCtx, async () => "");
+  const finished = h.waitForDream();
+  for (let index = 0; index < 8; index++) await h.event("agent_settled");
+  await finished;
+  assert.deepEqual(h.notices, []);
+  assert.equal((await readMemorySchedule(h.handle)).pendingTurns, 0);
+});
+
 test("long single-line Unicode notes remain fully readable through bounded valid JSON pages", async (testCtx) => {
   const h = await createExtensionHarness(testCtx);
   const original = "😀".repeat(8000) + '"'.repeat(12000);
