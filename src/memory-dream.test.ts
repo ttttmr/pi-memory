@@ -98,7 +98,12 @@ test("detached supervisor enforces its own deadline even when a worker ignores g
   const fakeCli = join(h.directory, "hung-worker.cjs");
   await writeFile(fakeCli, 'process.on("SIGTERM", () => {}); setInterval(() => {}, 1000);');
   let exited!: Promise<NodeJS.Signals | null>;
+  let notifyTimeout!: (state: string) => void;
+  const timeoutNotification = new Promise<string>((resolve) => { notifyTimeout = resolve; });
+  const controller = new AbortController();
+  ctx.after(() => controller.abort());
   const receipt = await runMemoryDream(h.options, { cliPath: fakeCli, timeoutMs: 500, killGraceMs: 50,
+    statusSignal: controller.signal, onStatus: (notification) => notifyTimeout(notification.state),
     spawn(command, args, options) {
       const child = spawn(command, args, options);
       exited = new Promise((resolve) => { child.once("exit", (_code, signal) => resolve(signal)); });
@@ -109,6 +114,7 @@ test("detached supervisor enforces its own deadline even when a worker ignores g
   const directory = await runDirectory(h.options);
   const status = await waitForStatus(directory, (state) => state.state === "timed_out");
   assert.match(String(status.error), /wall-clock deadline/);
+  assert.equal(await timeoutNotification, "timed_out");
   assert.equal(await exited, "SIGKILL", "The independent supervisor actually enforces its hard-kill grace");
   assert.equal(JSON.parse(await readFile(join(directory, "status.json"), "utf8")).state, "timed_out");
   assert.equal((await readMemorySchedule(h.options.handle)).pendingTurns, 50);
@@ -178,12 +184,24 @@ test("real isolated Pi dream reads raw synthetic sessions with normal tools and 
   const original = await readFile(h.source, "utf8");
   testEnvironment(ctx, { PI_OFFLINE: "1", PI_SKIP_VERSION_CHECK: "1", PI_TELEMETRY: "0", JITI_FS_CACHE: "false",
     PI_MEMORY_TEST_TRACE: trace, PI_MEMORY_TEST_SOURCE: h.source });
-  const receipt = await runMemoryDream(h.options, { cliPath, cliArgs: ["--offline", "--approve", "--no-extensions", "--no-mcp", "--no-skills",
+  const observedStates: string[] = [];
+  let terminal!: (state: string) => void;
+  const terminalNotice = new Promise<string>((resolve) => { terminal = resolve; });
+  const controller = new AbortController();
+  ctx.after(() => controller.abort());
+  const receipt = await runMemoryDream(h.options, { cliPath,
+    statusSignal: controller.signal, onStatus(notification) {
+      observedStates.push(notification.state);
+      if (notification.state !== "running") terminal(notification.state);
+    }, cliArgs: ["--offline", "--approve", "--no-extensions", "--no-mcp", "--no-skills",
     "--no-prompt-templates", "--no-context-files", "--no-session", "-e", join(packageRoot, "test/memory-dream-provider.ts")] });
   cleanupSupervisor(ctx, receipt);
   const directory = await runDirectory(h.options);
   const status = await waitForStatus(directory, (state) => ["completed", "failed"].includes(String(state.state)));
   assert.equal(status.state, "completed", JSON.stringify(status) + "\n" + await readFile(join(directory, "supervisor.log"), "utf8") + "\n" + (await readFile(join(directory, "events.jsonl"), "utf8")).slice(-16000));
+  assert.equal(await terminalNotice, "completed");
+  assert.equal(observedStates.at(-1), "completed");
+  assert.equal(new Set(observedStates).size, observedStates.length);
   const calls = (await readFile(trace, "utf8")).trim().split("\n").map((line) => JSON.parse(line));
   assert.ok(calls.length > 32, `Observed ${calls.length} model calls`);
   assert.ok(calls.at(-1).results > 64);

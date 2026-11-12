@@ -10,6 +10,7 @@ import {
   resolveMemoryProject, writeMemoryNote, type MemoryStoreHandle,
 } from "./memory-store.ts";
 import { buildMemoryRecall, searchMemoryNotes } from "./memory-search.ts";
+import type { MemoryDreamNotification } from "./memory-dream-notifications.ts";
 import { runMemoryDream, type MemoryDreamOptions } from "./memory-dream.ts";
 import {
   createMemoryObservationQueue, type MemoryObservationQueue, type MemoryObservationQueueOptions,
@@ -20,6 +21,9 @@ interface MemoryObservationRuntime {
   queue?: MemoryObservationQueue;
   callbacks: MemoryObservationQueueOptions;
   launch?: Promise<void>;
+  statusControllers?: Set<AbortController>;
+  pendingNotifications?: MemoryDreamNotification[];
+  notify?: (notification: MemoryDreamNotification) => void;
 }
 const observationRuntimeKey = Symbol.for("pi-memory.observation-runtime");
 const observationRuntimeRegistry = globalThis as typeof globalThis & { [key: symbol]: MemoryObservationRuntime | undefined };
@@ -148,12 +152,35 @@ export default function piMemoryExtension(
       const current = latestObservation;
       if (!current || current.handle.directory !== handle.directory || current.sessionId !== turn.sessionId ||
           current.entryId !== turn.entryId || !dreamEnabled || isDreamWorker || !snapshot.due || observationRuntime.launch) return;
-      // Only startup acknowledgment is tracked; detached execution has no frontend lifecycle.
-      const launch = dreamRunner(current.launch).then((receipt) => {
-        if (!receipt) return;
+      // Observation never owns or waits for the detached worker's lifecycle.
+      const controller = new AbortController();
+      (observationRuntime.statusControllers ??= new Set()).add(controller);
+      let launchDelivered = false;
+      const earlyNotifications: MemoryDreamNotification[] = [];
+      const deliverStatus = (notification: MemoryDreamNotification) => {
+        if (!controller.signal.aborted) observationRuntime.notify?.(notification);
+      };
+      const launch = dreamRunner(current.launch, {
+        statusSignal: controller.signal,
+        onStatus(notification) {
+          if (notification.state !== "running") observationRuntime.statusControllers?.delete(controller);
+          // Deliver the launch receipt first, even when the worker finishes immediately.
+          if (launchDelivered) deliverStatus(notification);
+          else earlyNotifications.push(notification);
+        },
+      }).then((receipt) => {
+        if (!receipt) {
+          controller.abort();
+          observationRuntime.statusControllers?.delete(controller);
+          return;
+        }
         if (observationContext?.hasUI) observationContext.ui.notify(receipt, "info");
         else console.error(receipt); // Keep JSON/RPC stdout reserved for the host protocol.
+        launchDelivered = true;
+        for (const notification of earlyNotifications) deliverStatus(notification);
       }, (error: unknown) => {
+        controller.abort();
+        observationRuntime.statusControllers?.delete(controller);
         const message = `Memory dreaming launch failed: ${error instanceof Error ? error.message : String(error)}`;
         if (observationContext) showMemoryCommand(observationContext, message, "warning");
         else console.error(message);
@@ -171,6 +198,14 @@ export default function piMemoryExtension(
   };
   const observationRuntime = observationRuntimeRegistry[observationRuntimeKey] ??= { callbacks: observationCallbacks };
   observationRuntime.callbacks = observationCallbacks;
+  observationRuntime.notify = (notification) => {
+    if (!observationContext) {
+      (observationRuntime.pendingNotifications ??= []).push(notification);
+      return;
+    }
+    if (observationContext.hasUI) observationContext.ui.notify(notification.message, notification.type);
+    else console.error(notification.message);
+  };
   const observations = observationRuntime.queue ??= observationQueueFactory({
     onRecorded: (handle, turn, snapshot) => observationRuntime.callbacks.onRecorded(handle, turn, snapshot),
     onError: (handle, error) => observationRuntime.callbacks.onError(handle, error),
@@ -184,6 +219,7 @@ export default function piMemoryExtension(
   pi.registerFlag("pi-memory-no-dream", { description: "Disable automatic extra model calls for memory dreaming", type: "boolean", default: false });
   pi.on("session_start", async (_event, ctx) => {
     observationContext = ctx;
+    for (const notification of observationRuntime.pendingNotifications?.splice(0) ?? []) observationRuntime.notify?.(notification);
     resetObservationContext();
     // Existing messages, including abandoned branches, are a baseline, not new observations.
     observedUserEntries.clear();
@@ -207,6 +243,8 @@ export default function piMemoryExtension(
       observationContext = undefined;
       return;
     }
+    for (const controller of observationRuntime.statusControllers ?? []) controller.abort();
+    observationRuntime.statusControllers?.clear();
     const pending = await observations.close();
     if (observationRuntimeRegistry[observationRuntimeKey] === observationRuntime) {
       delete observationRuntimeRegistry[observationRuntimeKey];

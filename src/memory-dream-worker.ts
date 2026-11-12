@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { writeFile } from "node:fs/promises";
+import { rename, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { claimMemoryDream, finishMemoryDream, type MemoryDreamClaim, type MemoryDreamSession } from "./memory-schedule.ts";
@@ -41,8 +41,10 @@ export default function memoryDreamWorker(pi: ExtensionAPI): void {
   let initializationError: unknown;
 
   const status = async (state: string, extra: Record<string, unknown> = {}) => {
-    await writeFile(join(config.runDirectory, "status.json"), JSON.stringify({ state, deadline: config.deadline,
+    const temporary = join(config.runDirectory, `status.${process.pid}.tmp`);
+    await writeFile(temporary, JSON.stringify({ state, deadline: config.deadline,
       workerPid: process.pid, updatedAt: new Date().toISOString(), ...extra }) + "\n", { mode: 0o600 });
+    await rename(temporary, join(config.runDirectory, "status.json"));
   };
   const finish = async (success: boolean, error?: string) => {
     if (finalized || !claim) return;

@@ -4,6 +4,7 @@ import { lstat, mkdir, mkdtemp, open, readFile, realpath, writeFile } from "node
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { getPackageDir } from "@earendil-works/pi-coding-agent";
+import { watchMemoryDreamStatus, type MemoryDreamNotification } from "./memory-dream-notifications.ts";
 import { hasActiveMemoryDream, readMemorySchedule } from "./memory-schedule.ts";
 import type { MemoryStoreHandle } from "./memory-store.ts";
 
@@ -26,6 +27,8 @@ export interface MemoryDreamWorkerConfig extends MemoryDreamOptions {
 }
 
 interface MemoryDreamLaunchDependencies {
+  onStatus?: (notification: MemoryDreamNotification) => void;
+  statusSignal?: AbortSignal;
   cliPath?: string;
   cliArgs?: string[];
   timeoutMs?: number;
@@ -37,7 +40,7 @@ interface MemoryDreamLaunchDependencies {
 // with its own peer aliases, even when this git-installed package has no local node_modules.
 const MEMORY_DREAM_SUPERVISOR = `
 const { spawn, spawnSync } = require("node:child_process");
-const { readFileSync, writeFileSync, openSync, closeSync } = require("node:fs");
+const { readFileSync, writeFileSync, renameSync, openSync, closeSync } = require("node:fs");
 const { join } = require("node:path");
 const config = JSON.parse(process.env.PI_MEMORY_DREAM_CONFIG);
 const launch = JSON.parse(process.env.PI_MEMORY_DREAM_LAUNCH);
@@ -45,7 +48,9 @@ const statusPath = join(config.runDirectory, "status.json");
 function status(state, extra = {}) {
   let previous = {};
   try { previous = JSON.parse(readFileSync(statusPath, "utf8")); } catch {}
-  writeFileSync(statusPath, JSON.stringify({ ...previous, state, updatedAt: new Date().toISOString(), ...extra }) + "\\n", { mode: 0o600 });
+  const temporary = statusPath + "." + process.pid + ".tmp";
+  writeFileSync(temporary, JSON.stringify({ ...previous, state, updatedAt: new Date().toISOString(), ...extra }) + "\\n", { mode: 0o600 });
+  renameSync(temporary, statusPath);
 }
 function readDreamProcesses() {
   // Two deadline-triggered snapshots, not a watcher or polling loop. lstart helps
@@ -172,6 +177,13 @@ export async function runMemoryDream(
     });
     await new Promise<void>((resolve, reject) => { child.once("spawn", resolve); child.once("error", reject); });
     child.unref();
+    if (dependencies.onStatus && dependencies.statusSignal) {
+      try { watchMemoryDreamStatus(runDirectory, config.deadline, dependencies.onStatus, dependencies.statusSignal); }
+      catch {
+        dependencies.onStatus({ state: "unavailable", type: "warning",
+          message: `Memory dreaming status monitoring unavailable; completion is unknown. Run status and logs: ${runDirectory}` });
+      }
+    }
     return `Memory dreaming launched independently (supervisor PID ${child.pid}); this is not a completion receipt. Run status and logs: ${runDirectory}`;
   } catch (error) {
     await writeFile(join(runDirectory, "status.json"), JSON.stringify({ state: "failed", error: String(error) }) + "\n", { mode: 0o600 });

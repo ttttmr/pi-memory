@@ -67,7 +67,7 @@ async function createExtensionHarness(
     sendUserMessage: (content: string, options: { deliverAs?: string; expandPromptTemplates?: boolean }) => requests.push({ content, options }),
     on: (event: ExtensionEvent["type"], handler: MockHandler) => { handlers.set(event, handler); return () => {}; },
   } as unknown as ExtensionAPI;
-  registerExtension(pi, dream ? async (options) => { const result = await dream(options); dreamFinished?.(); return result; } : undefined, observationQueueFactory);
+  registerExtension(pi, dream ? async (options, dependencies) => { const result = await dream(options, dependencies); dreamFinished?.(); return result; } : undefined, observationQueueFactory);
   await handlers.get("session_start")?.({}, ctx);
   testCtx.after(async () => { await handlers.get("session_shutdown")?.({}, ctx); });
   const handle = createMemoryStoreHandle(root, cwd, "project");
@@ -284,6 +284,61 @@ test("project user-message totals persist across sessions and launch without fro
   const state = JSON.parse(await readFile(join(h.handle.directory, ".dream-state.json"), "utf8"));
   assert.equal(new Set(state.messages.map((message: { sessionId: string }) => message.sessionId)).size, 2);
   assert.ok(state.messages.every((message: { sessionFile: string }) => message.sessionFile.endsWith(".jsonl")));
+});
+
+test("dream status notifications follow launch, survive replacement and stop on quit without acknowledging work", async (testCtx) => {
+  let dependencies: Parameters<typeof runMemoryDream>[1];
+  const h = await createExtensionHarness(testCtx, async (_options, callbacks) => {
+    dependencies = callbacks;
+    callbacks?.onStatus?.({ state: "running", type: "info", message: "Worker running" });
+    return "Worker launch receipt";
+  });
+  h.setLeaf(50);
+  const launched = h.waitForDream();
+  await h.event("agent_settled", false);
+  await launched;
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(h.notices, ["Worker launch receipt", "Worker running"]);
+  assert.equal(dependencies?.statusSignal?.aborted, false);
+  await h.event("session_shutdown", false, { reason: "reload" });
+  dependencies?.onStatus?.({ state: "completed", type: "info", message: "Worker completed" });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(h.notices.length, 2, "Notifications wait while there is no live UI context");
+  await h.event("session_start");
+  assert.equal(h.notices.at(-1), "Worker completed");
+  assert.equal((await readMemorySchedule(h.handle)).pendingTurns, 50);
+});
+
+test("replacement extension routes existing dream notifications only to the new UI", async (testCtx) => {
+  let dependencies: Parameters<typeof runMemoryDream>[1];
+  const old = await createExtensionHarness(testCtx, async (_options, callbacks) => {
+    dependencies = callbacks;
+    return "Worker launch receipt";
+  });
+  old.setLeaf(50);
+  await old.event("agent_settled", false);
+  await old.event("session_shutdown", false, { reason: "reload" });
+  const replacement = await createExtensionHarness(testCtx, undefined, [], { cwd: old.cwd, root: old.root });
+  dependencies?.onStatus?.({ state: "completed", type: "info", message: "Worker completed" });
+  assert.deepEqual(old.notices, ["Worker launch receipt"]);
+  assert.deepEqual(replacement.notices, ["Worker completed"]);
+  assert.equal(dependencies?.statusSignal?.aborted, false);
+});
+
+test("quitting aborts status observation, not detached execution", async (testCtx) => {
+  let dependencies: Parameters<typeof runMemoryDream>[1];
+  const h = await createExtensionHarness(testCtx, async (_options, callbacks) => {
+    dependencies = callbacks;
+    return "Worker launch receipt";
+  });
+  h.setLeaf(50);
+  await h.event("agent_settled", false);
+  await h.event("session_shutdown", false, { reason: "quit" });
+  assert.equal(dependencies?.statusSignal?.aborted, true);
+  dependencies?.onStatus?.({ state: "failed", type: "error", message: "Worker failed" });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(h.notices, ["Worker launch receipt"]);
+  assert.equal((await readMemorySchedule(h.handle)).pendingTurns, 50);
 });
 
 test("settled counts every new user entry, not assistant leaves or notifications, and baselines history", async (testCtx) => {
