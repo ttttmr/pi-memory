@@ -56,6 +56,26 @@ test("lock release records queued A, duplicate A, B in order and latest-leaf rep
   assert.equal(await queue.close(), 0);
 });
 
+test("queued observations preserve the original session file through deferred lock recovery", async (ctx) => {
+  const root = await createMemoryTestDirectory(ctx);
+  const handle = createMemoryStoreHandle(root, "/session-file-project", "project");
+  const lockPath = await holdStoreLock(handle);
+  const recorded: MemoryObservationTurn[] = [];
+  const queue = createMemoryObservationQueue({
+    onRecorded(_handle, turn) { recorded.push(turn); },
+    onError(_handle, error) { throw error; },
+  });
+  ctx.after(() => queue.close());
+  const original = { sessionId: "original-session", entryId: "user-message", sessionFile: "/synthetic/original.jsonl" };
+  await queue.enqueue(handle, original);
+  original.sessionFile = "/synthetic/replaced.jsonl";
+  await rmdir(lockPath);
+  await queue.flush();
+  assert.deepEqual(recorded, [{ sessionId: "original-session", entryId: "user-message", sessionFile: "/synthetic/original.jsonl" }]);
+  const state = JSON.parse(await readFile(join(handle.directory, ".dream-state.json"), "utf8"));
+  assert.equal(state.messages[0].sessionFile, "/synthetic/original.jsonl");
+});
+
 test("different projects flush independently and close returns pending without waiting for a stale lock", async (ctx) => {
   const root = await createMemoryTestDirectory(ctx);
   const locked = createMemoryStoreHandle(root, "/locked-project", "project");

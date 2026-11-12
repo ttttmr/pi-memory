@@ -45,13 +45,17 @@ async function createExtensionHarness(
   let sessionId = "synthetic-session";
   let leafNumber = 0;
   let dreamFinished: (() => void) | undefined;
+  const userEntries = () => Array.from({ length: leafNumber }, (_, index) => ({
+    type: "message", id: `synthetic-entry-${index + 1}`, message: { role: "user", content: "Synthetic task" },
+  }));
   const ctx = {
     cwd, hasUI: true, mode: "print", isProjectTrusted: () => trusted,
-    model: { id: "synthetic-model", maxTokens: 65536 }, modelRegistry: {},
+    model: { id: "synthetic-model", provider: "synthetic-provider", maxTokens: 65536 }, modelRegistry: {},
     sessionManager: {
       getSessionId: () => sessionId, getLeafId: () => `synthetic-entry-${leafNumber}`,
       getCwd: () => cwd, getSessionDir: () => join(directory, "isolated-sessions"),
-      getEntries: () => [], getBranch: () => [],
+      getSessionFile: () => join(directory, "isolated-sessions", `${sessionId}.jsonl`),
+      getEntries: () => userEntries(), getBranch: () => userEntries(),
     },
     ui: { notify: (message: string) => notices.push(message), setStatus: (_key: string, value: string | undefined) => { if (!value) dreamFinished?.(); },
       confirm: () => { throw new Error("No mandatory human approval is allowed"); } },
@@ -59,11 +63,11 @@ async function createExtensionHarness(
   const pi = {
     registerTool: (definition: ToolDefinition) => tools.set(definition.name, definition),
     registerCommand: (name: string, command: { handler: (args: string, ctx: ExtensionCommandContext) => Promise<void> }) => commands.set(name, command.handler),
-    registerFlag: () => {}, getFlag: (name: string) => flags.includes(name),
+    registerFlag: () => {}, getFlag: (name: string) => flags.includes(name), getThinkingLevel: () => "medium",
     sendUserMessage: (content: string, options: { deliverAs?: string; expandPromptTemplates?: boolean }) => requests.push({ content, options }),
     on: (event: ExtensionEvent["type"], handler: MockHandler) => { handlers.set(event, handler); return () => {}; },
   } as unknown as ExtensionAPI;
-  registerExtension(pi, dream, observationQueueFactory);
+  registerExtension(pi, dream ? async (options) => { const result = await dream(options); dreamFinished?.(); return result; } : undefined, observationQueueFactory);
   await handlers.get("session_start")?.({}, ctx);
   testCtx.after(async () => { await handlers.get("session_shutdown")?.({}, ctx); });
   const handle = createMemoryStoreHandle(root, cwd, "project");
@@ -87,12 +91,6 @@ async function createExtensionHarness(
       await handlers.get(name)?.(payload, ctx);
     },
   };
-}
-
-function dreamBarrier() {
-  let resolve!: () => void;
-  const promise = new Promise<void>((done) => { resolve = done; });
-  return { promise, resolve };
 }
 
 function resultValue(result: Awaited<ReturnType<ToolDefinition["execute"]>>) {
@@ -170,6 +168,27 @@ test("autonomous Markdown writes, edits, links and archive work without human re
   await assert.rejects(h.call("memory_write", { action: "archive", path: "MEMORY.md", expectedHash: (await readMemoryNote(h.handle, "MEMORY.md"))!.hash }), /cannot be archived/);
 });
 
+test("archive accepts an empty content placeholder from model calls without weakening hash or history checks", async (testCtx) => {
+  const h = await createExtensionHarness(testCtx);
+  const original = "# Duplicate note\nRetain these original bytes in archive history.\n";
+  const saved = resultValue(await h.call("memory_write", { path: "duplicate.md", content: original, expectedHash: null }));
+  const archive = { action: "archive", path: "duplicate.md", content: "", expectedHash: saved.hash };
+  await assert.rejects(h.call("memory_write", { ...archive, content: "not an empty placeholder" }), /archive requires/);
+  await assert.rejects(h.call("memory_write", { ...archive, expectedHash: null }), /archive requires/);
+  await assert.rejects(h.call("memory_write", { ...archive, expectedHash: "0".repeat(64) }), /hash conflict/);
+  assert.equal((await readMemoryNote(h.handle, "duplicate.md"))!.content, original);
+  const result = resultValue(await h.call("memory_write", archive));
+  assert.equal(result.action, "archive");
+  assert.equal(result.hash, saved.hash);
+  assert.equal(await readMemoryNote(h.handle, "duplicate.md"), null);
+  const historyDirectory = join(h.handle.directory, ".history", "duplicate.md");
+  const snapshots = await readdir(historyDirectory);
+  assert.equal(snapshots.length, 1);
+  assert.equal(await readFile(join(historyDirectory, snapshots[0]), "utf8"), original);
+  const index = resultValue(await h.call("memory_write", { path: "MEMORY.md", content: "# Index", expectedHash: null }));
+  await assert.rejects(h.call("memory_write", { ...archive, path: "MEMORY.md", expectedHash: index.hash }), /cannot be archived/);
+});
+
 test("global writes are autonomous and isolated; project access still requires trust", async (testCtx) => {
   const h = await createExtensionHarness(testCtx);
   await h.call("memory_write", { scope: "global", path: "MEMORY.md", content: "# Shared nonprivate preference", expectedHash: null });
@@ -200,55 +219,6 @@ test("same-process parallel tool writes use Pi queue without losing files", asyn
   const h = await createExtensionHarness(testCtx);
   await Promise.all(Array.from({ length: 8 }, (_, index) => h.call("memory_write", { path: `notes/${index}.md`, content: `# Finding ${index}`, expectedHash: null })));
   assert.equal((await listMemoryNotes(h.handle)).length, 8);
-});
-
-test("dreaming uses independent project-only tools after 8 settled runs, and quit cancels it", async (testCtx) => {
-  let runs = 0;
-  let started!: () => void;
-  const didStart = new Promise<void>((resolve) => { started = resolve; });
-  const h = await createExtensionHarness(testCtx, async (options) => {
-    runs++;
-    await assert.rejects(options.tools[0].execute("synthetic-global", { scope: "global" }, undefined, undefined), /project-scoped/);
-    started();
-    await new Promise<void>((_resolve, reject) => { options.signal!.addEventListener("abort", () => reject(options.signal!.reason), { once: true }); });
-    return "unreachable";
-  });
-  assert.equal((await listMemoryNotes(h.handle)).length, 0, "No foreground note is needed for the first dream");
-  for (let index = 0; index < 8; index++) await h.event("agent_settled");
-  await didStart;
-  assert.equal(runs, 1);
-  await h.event("session_shutdown", false, { reason: "quit" });
-  assert.match(h.notices.at(-1)!, /cancelled by shutdown or extension reload/);
-  assert.equal((await readMemorySchedule(h.handle)).pendingTurns, 8, "Cancellation does not acknowledge pending experiences");
-});
-
-test("successful dreaming may update MEMORY.md itself, without scheduling itself forever", async (testCtx) => {
-  let runs = 0;
-  const h = await createExtensionHarness(testCtx, async (options) => {
-    runs++;
-    const writer = options.tools.find((tool) => tool.name === "memory_write")!;
-    await writer.execute("synthetic-index", { path: "MEMORY.md", content: "# Map\n- [Finding](note.md)", expectedHash: null }, options.signal, undefined);
-    return "Checked available source, preserved uncertainty, linked note.md";
-  });
-  await h.call("memory_write", { path: "note.md", content: "# Untested finding", expectedHash: null });
-  const finished = h.waitForDream();
-  for (let index = 0; index < 8; index++) await h.event("agent_settled");
-  await finished;
-  assert.equal(runs, 1);
-  assert.match((await readMemoryNote(h.handle, "MEMORY.md"))!.content, /note.md/);
-  for (let index = 0; index < 6; index++) await h.event("agent_settled");
-  await h.event("agent_settled", false);
-  assert.equal(runs, 1, "Dream writes and replayed leaf events do not create foreground work");
-  assert.equal((await readMemorySchedule(h.handle)).pendingTurns, 6);
-});
-
-test("no-change dreaming stays silent and acknowledges pending work", async (testCtx) => {
-  const h = await createExtensionHarness(testCtx, async () => "");
-  const finished = h.waitForDream();
-  for (let index = 0; index < 8; index++) await h.event("agent_settled");
-  await finished;
-  assert.deepEqual(h.notices, []);
-  assert.equal((await readMemorySchedule(h.handle)).pendingTurns, 0);
 });
 
 test("long single-line Unicode notes remain fully readable through bounded valid JSON pages", async (testCtx) => {
@@ -286,184 +256,122 @@ test("large escaped search results preserve valid JSON and explicitly mark dropp
   assert.ok(Buffer.byteLength(JSON.stringify(raw.content)) < 100000);
 });
 
-test("foreground input, runs and tree navigation leave active dreaming independent", { timeout: 5000 }, async (testCtx) => {
-  const started = dreamBarrier();
-  const release = dreamBarrier();
-  let signal!: AbortSignal;
-  const h = await createExtensionHarness(testCtx, async (options) => {
-    signal = options.signal!;
-    signal.addEventListener("abort", release.resolve, { once: true });
-    started.resolve();
-    await release.promise;
-    return "Completed independently";
-  });
-  testCtx.after(() => release.resolve());
-  for (let index = 0; index < 8; index++) await h.event("agent_settled");
-  await started.promise;
-  for (const event of ["input", "agent_start", "session_before_tree", "session_before_fork", "session_before_switch"]) {
-    await h.event(event);
-    assert.equal(signal.aborted, false, event);
-  }
-  const finished = h.waitForDream();
-  release.resolve();
-  await finished;
-  assert.match(h.notices.at(-1)!, /Completed independently/);
-  assert.equal(h.notices.some((notice) => notice.includes("cancelled")), false);
-  assert.equal((await readMemorySchedule(h.handle)).pendingTurns, 0);
-});
-
-for (const reason of ["new", "resume", "fork"]) {
-  test(`active dreaming survives ${reason} runtime replacement without using retired context`, { timeout: 5000 }, async (testCtx) => {
-    const started = dreamBarrier();
-    const release = dreamBarrier();
-    let signal!: AbortSignal;
-    const h = await createExtensionHarness(testCtx, async (options) => {
-      signal = options.signal!;
-      signal.addEventListener("abort", release.resolve, { once: true });
-      started.resolve();
-      await release.promise;
-      const sources = await options.sourceProvider.search("original evidence");
-      assert.equal(sources.sources[0]?.id, "synthetic-session:evidence:0");
-      const writer = options.tools.find((tool) => tool.name === "memory_write")!;
-      const saved = resultValue(await writer.execute("save", { path: "retained.md", content: "Original project finding", expectedHash: null }, signal, undefined));
-      assert.match(saved.sourceHint, /synthetic-session/);
-      const reader = options.tools.find((tool) => tool.name === "memory_read")!;
-      assert.equal(resultValue(await reader.execute("read", { path: "retained.md" }, signal, undefined)).content, "Original project finding");
-      const search = options.tools.find((tool) => tool.name === "memory_search")!;
-      assert.equal(resultValue(await search.execute("search", {}, signal, undefined))[0].path, "retained.md");
-      return "Retained original project";
-    });
-    testCtx.after(() => release.resolve());
-    testCtx.mock.method(h.ctx.sessionManager, "getBranch", () => [{
-      type: "message", id: "evidence", parentId: null, timestamp: "2026-01-01T00:00:00Z",
-      message: { role: "user", content: "original evidence", timestamp: 1 },
-    }]);
-    for (let index = 0; index < 8; index++) await h.event("agent_settled");
-    await started.promise;
-    await h.event("session_shutdown", false, { reason });
-    assert.equal(signal.aborted, false);
-    for (const key of ["cwd", "hasUI", "ui", "sessionManager", "model", "modelRegistry", "isProjectTrusted"]) {
-      Object.defineProperty(h.ctx, key, { configurable: true, get() { throw new Error("Retired Pi context accessed"); } });
-    }
-    const reloaded = await import(new URL(`./memory-extension.ts?dream-replacement-${reason}`, import.meta.url).href);
-    const replacement = await createExtensionHarness(testCtx, async () => { throw new Error("Replacement must not duplicate the active task"); }, [], undefined, undefined, reloaded.default);
-    const finished = replacement.waitForDream();
-    release.resolve();
-    await finished;
-    assert.match(replacement.notices.at(-1)!, /Retained original project/);
-    assert.equal((await readMemoryNote(h.handle, "retained.md"))?.content, "Original project finding");
-    assert.equal(await readMemoryNote(replacement.handle, "retained.md"), null);
-    assert.equal((await readMemorySchedule(h.handle)).pendingTurns, 0);
-  });
-}
-
-for (const succeeds of [true, false]) {
-  test(`new settled work is retained during dreaming; successful completion alone schedules follow-on (${succeeds})`, { timeout: 5000 }, async (testCtx) => {
-    const started = dreamBarrier();
-    const release = dreamBarrier();
-    const secondStarted = dreamBarrier();
-    const secondRelease = dreamBarrier();
-    let runs = 0;
-    const h = await createExtensionHarness(testCtx, async (options) => {
-      options.signal!.addEventListener("abort", () => { release.resolve(); secondRelease.resolve(); }, { once: true });
-      runs++;
-      if (runs === 1) {
-        started.resolve();
-        await release.promise;
-        if (!succeeds) throw new Error("Synthetic model failure");
-      } else {
-        secondStarted.resolve();
-        await secondRelease.promise;
-      }
-      return "Done";
-    });
-    testCtx.after(() => { release.resolve(); secondRelease.resolve(); });
-    for (let index = 0; index < 8; index++) await h.event("agent_settled");
-    await started.promise;
-    for (let index = 0; index < 8; index++) {
-      await h.event("input");
-      await h.event("agent_start");
-      await h.event("agent_settled");
-    }
-    assert.equal(runs, 1);
-    const finished = h.waitForDream();
-    release.resolve();
-    await finished;
-    if (succeeds) {
-      await secondStarted.promise;
-      assert.equal((await readMemorySchedule(h.handle)).pendingTurns, 8);
-      const secondFinished = h.waitForDream();
-      secondRelease.resolve();
-      await secondFinished;
-      assert.equal(runs, 2);
-      assert.equal((await readMemorySchedule(h.handle)).pendingTurns, 0);
-    } else {
-      assert.equal((await readMemorySchedule(h.handle)).pendingTurns, 16);
-      assert.equal(runs, 1, "Failure does not immediately start another paid run");
-      assert.match(h.notices.at(-1)!, /Synthetic model failure/);
-    }
-  });
-}
-
-for (const reason of ["quit", "reload"]) {
-  test(`${reason} in a replacement runtime cancels the surviving task and preserves pending work`, { timeout: 5000 }, async (testCtx) => {
-    const started = dreamBarrier();
-    const h = await createExtensionHarness(testCtx, async (options) => {
-      started.resolve();
-      await new Promise<void>((_resolve, reject) => options.signal!.addEventListener("abort", () => reject(options.signal!.reason), { once: true }));
-      return "unreachable";
-    });
-    for (let index = 0; index < 8; index++) await h.event("agent_settled");
-    await started.promise;
-    await h.event("session_shutdown", false, { reason: "resume" });
-    const replacement = await createExtensionHarness(testCtx, undefined, [], h);
-    await replacement.event("session_shutdown", false, { reason });
-    assert.equal((await readMemorySchedule(h.handle)).pendingTurns, 8);
-    assert.match(replacement.notices.at(-1)!, /cancelled by shutdown or extension reload/);
-    const state = JSON.parse(await readFile(join(h.handle.directory, ".dream-state.json"), "utf8"));
-    assert.equal(state.claim, null, "Cancellation releases the original runtime's lease");
-  });
-}
-
-test("pending experiences survive short sessions and a fresh extension without foreground memory writes", async (testCtx) => {
+test("project user-message totals persist across sessions and launch without frontend acknowledgment of completion", async (testCtx) => {
   let runs = 0;
-  const runner: typeof runMemoryDream = async () => { runs++; return "No supported reusable finding; no write needed"; };
-  const h = await createExtensionHarness(testCtx, runner);
-  for (let index = 0; index < 4; index++) await h.event("agent_settled");
+  const h = await createExtensionHarness(testCtx, async (options) => {
+    runs++;
+    assert.deepEqual(options.model, { provider: "synthetic-provider", id: "synthetic-model" });
+    assert.equal(options.thinkingLevel, "medium");
+    assert.equal(options.handle.directory, h.handle.directory);
+    assert.ok(options.sessionRoots.some((root) => root.endsWith("isolated-sessions")));
+    assert.equal("signal" in options, false);
+    assert.equal("tools" in options, false);
+    return "Detached worker started";
+  });
+  for (let index = 0; index < 25; index++) await h.event("agent_settled");
   await h.event("agent_settled", false);
-  assert.equal((await readMemorySchedule(h.handle)).pendingTurns, 4);
+  assert.equal((await readMemorySchedule(h.handle)).pendingTurns, 25);
   h.setSession("another-synthetic-session");
   await h.event("session_start");
-  for (let index = 0; index < 3; index++) await h.event("agent_settled");
+  for (let index = 0; index < 24; index++) await h.event("agent_settled");
   assert.equal(runs, 0);
-  const finished = h.waitForDream();
+  const launched = h.waitForDream();
   await h.event("agent_settled");
-  await finished;
+  await launched;
   assert.equal(runs, 1);
-  assert.deepEqual(await readMemorySchedule(h.handle), { observedTurns: 8, processedTurns: 8, pendingTurns: 0, due: false });
+  assert.equal((await readMemorySchedule(h.handle)).pendingTurns, 50, "Only the worker may mark work complete");
   assert.equal((await listMemoryNotes(h.handle)).length, 0);
+  const state = JSON.parse(await readFile(join(h.handle.directory, ".dream-state.json"), "utf8"));
+  assert.equal(new Set(state.messages.map((message: { sessionId: string }) => message.sessionId)).size, 2);
+  assert.ok(state.messages.every((message: { sessionFile: string }) => message.sessionFile.endsWith(".jsonl")));
+});
 
-  const next = await createExtensionHarness(testCtx, runner);
-  // Bind the fresh runtime to the original project/root rather than its newly allocated fixture project.
-  (next.ctx as { cwd: string }).cwd = h.cwd;
-  process.env.PI_MEMORY_DIR = h.root;
-  next.setSession("third-synthetic-session");
-  await next.event("session_start");
-  for (let index = 0; index < 4; index++) await next.event("agent_settled");
-  assert.equal((await readMemorySchedule(h.handle)).pendingTurns, 4);
-  assert.equal(runs, 1, "Startup and fewer than eight new experiences do not make extra model calls");
+test("settled counts every new user entry, not assistant leaves or notifications, and baselines history", async (testCtx) => {
+  const h = await createExtensionHarness(testCtx);
+  h.setLeaf(12);
+  await h.event("session_start");
+  await h.event("agent_settled", false);
+  assert.equal((await readMemorySchedule(h.handle)).observedTurns, 0);
+  h.setLeaf(15);
+  await h.event("agent_settled", false);
+  assert.equal((await readMemorySchedule(h.handle)).observedTurns, 3);
+  await h.event("agent_settled", false);
+  await h.event("session_before_tree");
+  h.setLeaf(13);
+  await h.event("agent_settled", false);
+  h.setLeaf(15);
+  await h.event("agent_settled", false);
+  assert.equal((await readMemorySchedule(h.handle)).observedTurns, 3);
+  testCtx.mock.method(h.ctx.sessionManager, "getBranch", () => [{
+    type: "message", id: "assistant-leaf", parentId: null, timestamp: "synthetic", message: {
+      role: "assistant", content: [],
+    },
+  }] as unknown as ReturnType<ExtensionContext["sessionManager"]["getBranch"]>);
+  await h.event("agent_settled", false);
+  assert.equal((await readMemorySchedule(h.handle)).observedTurns, 3);
+});
+
+for (const reason of ["quit", "reload", "new", "resume", "fork"]) {
+  test(`frontend ${reason} never waits for or cancels an independent worker`, async (testCtx) => {
+    let release!: (value: string) => void;
+    let launched = false;
+    let workerFinished = false;
+    const pendingWorker = new Promise<void>((resolve) => { release = () => { workerFinished = true; resolve(); }; });
+    const h = await createExtensionHarness(testCtx, async () => { launched = true; return "Detached worker launch acknowledged"; });
+    h.setLeaf(50);
+    await h.event("agent_settled", false);
+    assert.equal(launched, true);
+    await h.event("session_shutdown", false, { reason });
+    assert.equal((await readMemorySchedule(h.handle)).pendingTurns, 50);
+    assert.equal(workerFinished, false);
+    release("Finished independently");
+    await pendingWorker;
+  });
+}
+
+test("shutdown waits only for launch acknowledgment and concurrent due observations share startup", async (testCtx) => {
+  let release!: (value: string) => void;
+  let launches = 0;
+  const acknowledgment = new Promise<string>((resolve) => { release = resolve; });
+  const h = await createExtensionHarness(testCtx, async () => { launches++; return acknowledgment; });
+  h.setLeaf(50);
+  await h.event("agent_settled", false);
+  await h.event("agent_settled");
+  assert.equal(launches, 1);
+  let shutDown = false;
+  const shutdown = h.event("session_shutdown", false, { reason: "quit" }).then(() => { shutDown = true; });
+  await Promise.resolve();
+  assert.equal(shutDown, false, "The process must not exit before the detached worker is spawned");
+  release("Worker PID and log path acknowledged");
+  await shutdown;
+  assert.equal(shutDown, true);
+  assert.equal((await readMemorySchedule(h.handle)).pendingTurns, 51, "Startup acknowledgment is not worker completion");
+});
+
+test("dream worker retains memory tools and recall but never records or launches recursive work", async (testCtx) => {
+  const old = process.env.PI_MEMORY_DREAM_WORKER;
+  process.env.PI_MEMORY_DREAM_WORKER = "1";
+  testCtx.after(() => { if (old === undefined) delete process.env.PI_MEMORY_DREAM_WORKER; else process.env.PI_MEMORY_DREAM_WORKER = old; });
+  let calls = 0;
+  const h = await createExtensionHarness(testCtx, async () => { calls++; return "must not launch"; });
+  await h.call("memory_write", { path: "MEMORY.md", content: "# Worker index", expectedHash: null });
+  h.setLeaf(60);
+  await h.event("agent_settled", false);
+  assert.equal(calls, 0);
+  assert.equal((await readMemorySchedule(h.handle)).observedTurns, 0);
+  assert.equal((await h.context([{ role: "user", content: "Synthetic maintenance", timestamp: 1 }])).messages.length, 2);
 });
 
 test("agent_settled lock contention queues both turns and automatically dreams when the lock is released", async (testCtx) => {
   let runs = 0;
   const h = await createExtensionHarness(testCtx, async () => { runs++; return "No changes needed"; });
-  for (let index = 0; index < 6; index++) await h.event("agent_settled");
+  for (let index = 0; index < 48; index++) await h.event("agent_settled");
   const lock = `${h.handle.directory}.lock`;
   await mkdir(lock);
   await h.event("agent_settled");
   await h.event("agent_settled", false);
   await h.event("agent_settled");
-  assert.equal((await readMemorySchedule(h.handle)).observedTurns, 6);
+  assert.equal((await readMemorySchedule(h.handle)).observedTurns, 48);
   assert.equal(runs, 0);
   assert.deepEqual(await readdir(lock), [], "The competing writer's lock is never removed or modified");
   let deadline!: ReturnType<typeof setTimeout>;
@@ -476,12 +384,12 @@ test("agent_settled lock contention queues both turns and automatically dreams w
     await Promise.race([finished, timedOut]);
   } finally { clearTimeout(deadline); }
   assert.equal(runs, 1);
-  assert.deepEqual(await readMemorySchedule(h.handle), { observedTurns: 8, processedTurns: 8, pendingTurns: 0, due: false });
+  assert.deepEqual(await readMemorySchedule(h.handle), { observedTurns: 50, processedTurns: 0, pendingTurns: 50, due: true });
   await h.event("agent_settled", false);
-  assert.equal((await readMemorySchedule(h.handle)).observedTurns, 8, "The restored latest leaf remains deduplicated");
+  assert.equal((await readMemorySchedule(h.handle)).observedTurns, 50, "The restored latest leaf remains deduplicated");
 });
 
-test("same-session reload shares FIFO observations so a late old leaf cannot defeat latest-leaf deduplication", { timeout: 3000 }, async (testCtx) => {
+test("same-session reload shares FIFO observations and user-message deduplication", { timeout: 3000 }, async (testCtx) => {
   const queues: MemoryObservationQueue[] = [];
   const recorded: string[] = [];
   const watchImplementation = (() => Object.assign(new EventEmitter(), { close() {} }) as FSWatcher) as typeof watch;
@@ -496,33 +404,34 @@ test("same-session reload shares FIFO observations so a late old leaf cannot def
   let runs = 0;
   const dream = async () => { runs++; return "No changes needed"; };
   const h = await createExtensionHarness(testCtx, dream, [], undefined, queueFactory);
-  for (let index = 0; index < 5; index++) await h.event("agent_settled");
+  for (let index = 0; index < 47; index++) await h.event("agent_settled");
   const lock = `${h.handle.directory}.lock`;
   await mkdir(lock);
-  await h.event("agent_settled"); // A: synthetic-entry-6, not yet committed.
+  await h.event("agent_settled"); // A: synthetic-entry-48, not yet committed.
   await h.event("session_shutdown", false, { reason: "reload" });
   const reloaded = await import(new URL("./memory-extension.ts?synthetic-reload", import.meta.url).href);
   const replacement = await createExtensionHarness(testCtx, dream, [], h, queueFactory, reloaded.default);
-  replacement.setLeaf(6); // Reload keeps the same session and leaf, not a new session.
-  await replacement.event("agent_settled"); // B: synthetic-entry-7.
+  replacement.setLeaf(48);
+  await replacement.event("session_start"); // Reload keeps the same session and leaf, not a new session.
+  await replacement.event("agent_settled"); // B: synthetic-entry-49.
   // Drain subscription rechecks under the held lock; then explicitly try the fresh queue first.
   for (const queue of queues) await queue.flush();
   await rmdir(lock);
   await queues.at(-1)!.flush();
   await queues[0]!.flush();
-  assert.equal((await readMemorySchedule(h.handle)).observedTurns, 7);
-  assert.deepEqual(recorded.slice(-2), ["synthetic-entry-6", "synthetic-entry-7"], "Module reload cannot create a competing FIFO");
+  assert.equal((await readMemorySchedule(h.handle)).observedTurns, 49);
+  assert.deepEqual(recorded.slice(-2), ["synthetic-entry-48", "synthetic-entry-49"], "Module reload cannot create a competing FIFO");
   assert.equal(queues.length, 1);
-  await replacement.event("agent_settled", false); // Replaying B must not count as an eighth turn.
-  assert.equal((await readMemorySchedule(h.handle)).observedTurns, 7);
+  await replacement.event("agent_settled", false); // Replaying B must not count as a new user message.
+  assert.equal((await readMemorySchedule(h.handle)).observedTurns, 49);
   assert.equal(runs, 0, "A duplicate notification must not trigger a paid dream early");
   const state = JSON.parse(await readFile(join(h.handle.directory, ".dream-state.json"), "utf8"));
-  assert.deepEqual(state.sessions, [{ sessionId: "synthetic-session", entryId: "synthetic-entry-7" }]);
+  assert.equal(state.messages[0].sessionId, "synthetic-session");
   const finished = replacement.waitForDream();
   await replacement.event("agent_settled");
   await finished;
-  assert.equal(runs, 1, "The new runtime, not stale callbacks, handles the legitimate eighth turn");
-  assert.deepEqual(await readMemorySchedule(h.handle), { observedTurns: 8, processedTurns: 8, pendingTurns: 0, due: false });
+  assert.equal(runs, 1, "The new runtime, not stale callbacks, handles the legitimate fiftieth user message");
+  assert.deepEqual(await readMemorySchedule(h.handle), { observedTurns: 50, processedTurns: 0, pendingTurns: 50, due: true });
 });
 
 test("session replacement retains queued old-session turns without starting a dream from stale context", async (testCtx) => {
@@ -533,12 +442,12 @@ test("session replacement retains queued old-session turns without starting a dr
   const queueFactory: typeof createMemoryObservationQueue = (callbacks) => {
     queue = createMemoryObservationQueue({ ...callbacks, onRecorded(handle, turn, snapshot) {
       callbacks.onRecorded(handle, turn, snapshot);
-      if (snapshot.observedTurns === 8) acknowledge();
+      if (snapshot.observedTurns === 50) acknowledge();
     } });
     return queue;
   };
   const h = await createExtensionHarness(testCtx, async () => { runs++; return "No changes needed"; }, [], undefined, queueFactory);
-  for (let index = 0; index < 6; index++) await h.event("agent_settled");
+  for (let index = 0; index < 48; index++) await h.event("agent_settled");
   const lock = `${h.handle.directory}.lock`;
   await mkdir(lock);
   await h.event("agent_settled");
@@ -547,7 +456,7 @@ test("session replacement retains queued old-session turns without starting a dr
   const replacement = await createExtensionHarness(testCtx, async () => { runs++; return "No changes needed"; }, [], h);
   replacement.setSession("replacement-session");
   await replacement.event("session_start");
-  assert.equal((await readMemorySchedule(h.handle)).observedTurns, 6);
+  assert.equal((await readMemorySchedule(h.handle)).observedTurns, 48);
   assert.equal(queue.pendingCount, 2, "Uncommitted observations survive runtime replacement in the same FIFO");
   let deadline!: ReturnType<typeof setTimeout>;
   const timedOut = new Promise<never>((_resolve, reject) => {
@@ -558,12 +467,12 @@ test("session replacement retains queued old-session turns without starting a dr
     await Promise.race([committed, timedOut]);
   } finally { clearTimeout(deadline); }
   assert.equal(runs, 0, "Neither the retired runtime nor fresh-session startup makes a paid dream call");
-  assert.equal((await readMemorySchedule(h.handle)).observedTurns, 8, "Old observations keep their original session and leaf identities");
+  assert.equal((await readMemorySchedule(h.handle)).observedTurns, 50, "Old observations keep their original session and leaf identities");
   const finished = replacement.waitForDream();
   await replacement.event("agent_settled");
   await finished;
   assert.equal(runs, 1, "Only a completed interaction in the replacement session starts a dream from fresh context");
-  assert.equal((await readMemorySchedule(h.handle)).observedTurns, 9);
+  assert.equal((await readMemorySchedule(h.handle)).observedTurns, 51);
 });
 
 test("quitting with a held lock reports unsaved observations instead of hanging or claiming persistence", async (testCtx) => {
@@ -577,7 +486,7 @@ test("quitting with a held lock reports unsaved observations instead of hanging 
   replacement.setSession("replacement-session");
   await replacement.event("session_start");
   await replacement.event("session_shutdown", false, { reason: "quit" });
-  assert.match(replacement.notices.at(-1) ?? "", /1 completed-turn observation.*not yet saved.*lost on exit/);
+  assert.match(replacement.notices.at(-1) ?? "", /1 user-message observation.*not yet saved.*lost on exit/);
   assert.deepEqual(await readdir(lock), []);
   assert.equal((await readMemorySchedule(h.handle)).observedTurns, 1);
   await rmdir(lock);
@@ -600,7 +509,7 @@ test("retired observation recovery never reads a stale Pi context when storage f
     deadline = setTimeout(() => reject(new Error("Retired observation error was not reported safely")), 3000);
     testCtx.mock.method(replacement.ctx.ui, "notify", (message: string) => {
       replacement.notices.push(message);
-      if (message.includes("Completed-turn observations remain queued")) resolve();
+      if (message.includes("User-message observations remain queued")) resolve();
     });
   });
   try {
@@ -616,11 +525,11 @@ test("automatic dreaming startup flag still persists pending experiences for lat
   let runs = 0;
   const flags = ["pi-memory-no-dream"];
   const h = await createExtensionHarness(testCtx, async () => { runs++; return "No changes"; }, flags);
-  for (let index = 0; index < 8; index++) await h.event("agent_settled");
+  for (let index = 0; index < 50; index++) await h.event("agent_settled");
   assert.equal(runs, 0);
   assert.equal((await readMemorySchedule(h.handle)).due, true);
   await h.event("session_start");
-  assert.equal((await readMemorySchedule(h.handle)).pendingTurns, 8);
+  assert.equal((await readMemorySchedule(h.handle)).pendingTurns, 50);
   flags.pop();
   await h.event("session_start");
   assert.equal(runs, 0, "Startup does not start a model run");
@@ -628,5 +537,5 @@ test("automatic dreaming startup flag still persists pending experiences for lat
   await h.event("agent_settled");
   await finished;
   assert.equal(runs, 1);
-  assert.equal((await readMemorySchedule(h.handle)).pendingTurns, 0);
+  assert.equal((await readMemorySchedule(h.handle)).pendingTurns, 51);
 });

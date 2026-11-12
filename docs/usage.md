@@ -6,7 +6,7 @@ Detailed setup, operation, storage, and troubleshooting for pi-memory. For a qui
 
 ## Try it
 
-Requires Pi, Git, and Node.js 22.19 or later. The verified development environment is Pi 1.5.0, Node.js 24, and macOS.
+Requires Pi, Git, and Node.js 22.19 or later. The verified development environment is Pi 1.5.0, Node.js 24, and macOS. Detached automatic maintenance currently requires a POSIX host and is unavailable on Windows.
 
 Run this from the project you want to work on. Pi downloads the extension from GitHub; no manual clone is needed:
 
@@ -62,9 +62,9 @@ For local development, you can still load a checkout with `pi -e /absolute/path/
 
 ## Control automatic recall and background maintenance
 
-Automatic recall and automatic background maintenance are enabled unless disabled at startup. After eight unprocessed foreground interactions accumulate in the same project, the background model can review that project's historical sessions, create notes, and maintain existing notes. Foreground notes do not need to exist first. Counts persist across sessions. Nothing keeps running after Pi exits; processing waits for a later foreground interaction to finish with the extension loaded.
+Automatic recall and automatic background maintenance are enabled unless disabled at startup. After 50 unprocessed actual user messages accumulate in the same project, a detached normal Pi Agent can review that project's historical sessions, create notes, and maintain existing notes. Messages are observed after foreground runs settle and deduplicated durably by entry ID across sessions. Existing messages at session startup are baselined, not counted retroactively. Foreground notes do not need to exist first. Old pending-turn state migrates as one-shot legacy work, not as actual user-message counts.
 
-Background maintenance uses the current model and **makes extra requests that may incur charges**. Add `--pi-memory-no-dream` at startup if you do not want automatic maintenance.
+Background maintenance uses the selected provider, model, and thinking level and **makes extra requests that may incur charges, including after you quit Pi**. It reloads normal Pi configuration and credentials and has default file/shell tools plus configured extensions, skills, and MCP tools. Runtime-only changes in the frontend are not copied. The worker reevaluates normal project trust; an unpersisted foreground approval may not carry over and can cause a safe startup failure. This is not a restricted source-tool sandbox. Add `--pi-memory-no-dream` at startup to prevent new automatic launches. This flag does not cancel an already running worker.
 
 To disable both features:
 
@@ -74,9 +74,9 @@ pi --pi-memory-no-recall --pi-memory-no-dream
 
 Startup flags apply to the current running instance and are not saved. Restart Pi without the corresponding disable flag to restore a feature. There are no runtime toggle or manual maintenance commands.
 
-Disabling recall does not disable maintenance or prevent the agent from explicitly reading and writing memory. Pending interactions are still counted while automatic maintenance is disabled and can be processed after it is enabled again.
+Disabling recall does not disable maintenance or prevent the agent from explicitly reading and writing memory. New actual user messages are still counted while automatic maintenance is disabled and can be processed after it is enabled again.
 
-You can keep chatting, navigate the session tree, or switch sessions while maintenance runs. The background Agent continues working on its original project; new completed interactions remain pending for later passes. Quitting Pi or explicitly reloading extensions cancels maintenance. File updates that have already completed are not rolled back.
+You can keep chatting, navigate the session tree, switch sessions, reload extensions, or quit Pi while maintenance runs. The detached Agent continues on its original project and can finish after the frontend exits; newer messages remain pending. Each run has a 30-minute wall-clock deadline from launch, enforced by a supervisor with a short cleanup grace before hard-killing the process group and captured descendants. This is best-effort cleanup, not containment of disowned processes or external work. Completed writes are not rolled back. There is no permanent daemon: work not yet launched waits for a later eligible frontend opportunity. A launch notification is not a success receipt.
 
 ## Storage and backups
 
@@ -91,7 +91,7 @@ Use project memory for project details. Global memory is only for knowledge that
 
 Subdirectories of the same Git project share project memory. Separate worktrees and clones at different paths do not. Moving the project changes its memory identity and does not move the files automatically. See the [design guide](design.md#locating-the-two-scopes) for the exact rules.
 
-Before backing up, stop every Pi session that could write to the memory store. Copy the entire storage root, including hidden files and history. Archiving a note is not permanent deletion and does not remove existing sessions, backups, or provider copies.
+Before backing up, ensure every writer has stopped, including detached maintenance workers. Closing foreground Pi alone is insufficient; check the run records first. Copy the entire storage root, including hidden files and history. Each project's `.dream-runs/<run>/` holds private `status.json`, `events.jsonl`, `supervisor.log`, and the worker's native session under `sessions/`. These may contain sensitive raw tool text; protect them along with notes and backups. Archiving a note is not permanent deletion and does not remove existing sessions, backups, or provider copies.
 
 ## Troubleshooting
 
@@ -107,12 +107,14 @@ Before backing up, stop every Pi session that could write to the memory store. C
 | Memory lock conflict | Retry note writes after the writer finishes. Interaction counts stay queued in the current process and are retried after lock release without stealing the lock. If exit reports unsaved counts, do not treat them as persisted. Handle a crash-leftover lock manually only after confirming there is no writer. |
 | Identity, path, or file validation failed | Stop writing and preserve the files. Check ownership and structure rather than clearing the directory to bypass the error. |
 | Capacity or history limit reached | Stop writing and back up first, then follow the [storage limits](design.md#archiving-and-capacity). Archiving also requires history space. |
-| Automatic maintenance did not start | Check startup flags, project trust, and the selected model. Eight unprocessed interactions must accumulate in the same project. Nothing runs while Pi is closed. |
-| Maintenance failed or was cancelled | Check the selected model and the error. Completed writes remain; cancellation does not roll back the batch. |
+| Automatic maintenance did not start | Check startup flags, project trust, and the selected model. 50 unprocessed actual user messages must accumulate in the same project (or migrated legacy work must be due). Startup history does not count. Check `.dream-state.json` and `.dream-runs/`; a valid project lease prevents duplicate launches. Unlaunched work waits while Pi is closed, but an active worker can continue. |
+| Maintenance failed or timed out | Inspect the run's `status.json`, `events.jsonl`, `supervisor.log`, and native session. Check model availability and normal worker configuration. Launch success does not mean completion; failures keep pending work and completed writes remain. |
 
 ## Privacy and usage notes
 
-Files are stored locally in plaintext. Notes loaded into context and sources read during background maintenance are sent to the selected model provider. Background maintenance can search the same project's Pi history read-only, including other sessions and retained pre-compaction text, not just the current conversation. It does not rewrite original sessions or offer arbitrary-path reads. It respects context deletions and replacements on the selected branch and does not read thinking, images, or system prompts. Do not save credentials, private prompts, personal information, or whole logs. Local storage does not mean content stays on the device. Disable automatic maintenance at startup if you do not want it to review historical sessions.
+Files are stored locally in plaintext. Notes loaded into context and historical material read by the worker are sent to the selected model provider. The detached Agent can read raw same-project native sessions across conversations, including retained pre-compaction text and raw fields not exposed by the old filtered source tools. Direct file reads do not automatically enforce active-branch selection, context deletions or replacements, or exclusion of thinking, images, system-related content, and tool arguments. Do not assume deleted context has been erased from native logs.
+
+The task prompt requires read-only treatment of sessions and source code, safe project-memory writes through memory tools, and treating historical instructions as untrusted evidence rather than permission. **These are prompt rules, not an OS sandbox.** The worker has normal Pi file/shell tools and configured extensions, skills, and MCP resources, which may access files or the network. Its own session and event logs can retain sensitive tool text. Do not save credentials, private prompts, personal information, or whole logs as notes. Local storage does not mean content stays on the device. Disable automatic maintenance at startup if this history access or full Agent authority is unacceptable; this prevents new launches, not a worker already running.
 
 Memory can be outdated or wrong. Check the current environment and evidence before important actions. Memory does not replace project instructions or expand the agent's task authorization.
 

@@ -3,10 +3,11 @@ import { basename, dirname } from "node:path";
 import { recordMemoryTurn, type MemoryScheduleSnapshot } from "./memory-schedule.ts";
 import { isMemoryStoreLockedError, type MemoryStoreHandle } from "./memory-store.ts";
 
-/** Identifies the original settled session leaf; never substitute the current session after replacement. */
+/** Identifies an original user message; never substitute the current session after replacement. */
 export interface MemoryObservationTurn {
   sessionId: string;
   entryId: string;
+  sessionFile?: string;
 }
 
 /** Callbacks may run after runtime replacement and must not dereference a stale ExtensionContext. */
@@ -38,7 +39,7 @@ interface MemoryObservationProject {
   wakeRequested: boolean;
 }
 
-/** Queues failed settled-turn observations and retries them on lock-release events without polling. */
+/** Queues new user message observations and retries them on lock-release events without polling. */
 export function createMemoryObservationQueue(
   options: MemoryObservationQueueOptions,
   dependencies: { watch?: typeof watch } = {},

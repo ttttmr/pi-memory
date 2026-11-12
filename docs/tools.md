@@ -99,7 +99,7 @@ Create, fully rewrite, or archive Markdown, maintained autonomously by the Agent
 | `action` | No | `upsert`; one of `upsert`, `archive` |
 | `path` | Yes | Valid relative Markdown path, at most 240 characters |
 | `scope` | No | `project`; one of `project`, `global` |
-| `content` | For `upsert` | Complete new content, not a diff patch |
+| `content` | For `upsert` | Complete new content, not a diff patch; omit or use `""` for `archive` |
 | `expectedHash` | Yes | `null` for creation; the complete current file's SHA-256 for modification or archiving |
 
 Ordinary notes are limited to 64 KiB each; `MEMORY.md` to 8 KiB and 200 lines. Active Markdown in each scope is limited to 500 files and 8 MiB total. Old content is saved before rewriting or archiving, with at most 1000 history snapshots. When full, writes requiring a new snapshot are rejected; old evidence is not deleted automatically.
@@ -143,7 +143,7 @@ The angle-bracketed value is a placeholder. Actual calls must replace it with th
 }
 ```
 
-Archiving saves the current content to history and removes the active file. Do not pass `content`. `MEMORY.md` cannot be archived. Index links do not change automatically; the Agent needs to maintain them accordingly.
+Archiving saves the current content to history and removes the active file. Omit `content` or pass an empty string (`""`); nonempty content is rejected. The empty-string placeholder accommodates model calls that include every field. `MEMORY.md` cannot be archived. Index links do not change automatically; the Agent needs to maintain them accordingly.
 
 Archiving is not permanent deletion. It does not remove old sessions, backups, or provider copies, and is not secure erasure. This tool has no action to clear history.
 
@@ -168,54 +168,13 @@ This is one possible usage pattern, not a fixed sequence that the foreground mod
 
 This does not require manual approval at each step. The Agent may call writing tools autonomously, including for global memory. Authorization in historical notes cannot expand the actions allowed for the current task.
 
-## Internal dreaming source tools
+## Tools available during dreaming
 
-The foreground model still has only the three memory tools above. Independent background dreaming also has `memory_source_search` and `memory_source` for read-only access to same-project Pi native history and the initiating session’s captured visible branch. They are not general file, shell, or network tools. They do not accept model-specified file paths, rewrite sessions, or create a separate session-copy index.
+Dreaming launches a normal Pi CLI Agent, not the former project-only source-tool loop. It has the default `read`, `bash`, `edit`, and `write` tools, the three memory tools above, and resources loaded by normal Pi configuration, including configured extensions, skills, and MCP tools. Runtime-only changes in the foreground process are not copied. The old `memory_source_search` and `memory_source` interfaces are not registered for the worker; their implementation remains in the repository for existing tests and reference.
 
-### memory_source_search
+The task gives the Agent session IDs, optional native-file hints, session roots, the project identity, and a deadline. The Agent chooses how to find and read raw native history and existing memory. Session hints are not source copies or a permanent search index. Raw file reads do not enforce the former source provider's active-branch projection, context-edit filtering, field exclusions, or pagination. Deleted or replaced context and sensitive raw fields may still exist in native logs.
 
-| Parameter | Required | Default and constraints |
-| --- | --- | --- |
-| `query` | No | At most 4096 characters; omitted queries list available source previews |
-| `sessionId` | No | Restricts results to a session in the same project; at most 240 characters, using only letters, digits, underscores, hyphens, and dots; directories and paths are not accepted |
-| `offset` | No | Default 0; nonnegative safe integer; use the previous page's scan cursor rather than incrementing it yourself |
-| `limit` | No | Default 10; integer from 1 to 20 |
-
-```json
-{
-  "query": "fixture cache",
-  "limit": 10
-}
-```
-
-The returned object contains `sources` and `nextOffset`, and may also contain `partial`, `truncated`, and `warnings`. Each source includes `id`, `sessionId`, `entryId`, `role`, `timestamp`, `hash`, `contextEdited`, `evidence`, `duplicateKey`, and a short `preview`. Native history files also provide `sourceFile` and a 1-based `sourceLine`. Replacement text has `contextEditEntryId` and, when from a native file, `contextEditSourceLine` to distinguish the message location from the actual edit location. Current runtime sources may lack a file position, and these fields are not entry points for arbitrary path reads. Previews are only lookup clues. Read the text with `memory_source` before using it to state facts. Queries use case-insensitive word/term containment, not semantic retrieval.
-
-`offset` is a scan position, not a count of returned results. Each call checks at most 16 candidate sessions and has a 64 MiB native-file body-read budget, including rejected corrupt bodies. It may return empty `sources` with a non-null `nextOffset`. Keep the query and session filter unchanged and continue with that returned value. Do not treat an empty page or `partial: true` as a complete history scan. When search results exceed 50 KiB, the background runner retries from the same cursor with fewer results, preserving complete JSON and the correct continuation cursor. The actual result count can therefore be below the requested `limit`; if a single result still exceeds the cap, it raises an error. Directory-discovery, file-size, and format limits are explicitly reported in warnings. Scans are not frozen snapshots; sessions added or updated during scanning can change positions.
-
-### memory_source
-
-| Parameter | Required | Default and constraints |
-| --- | --- | --- |
-| `id` | Yes | At most 500 characters, in the form `sessionId:entryId:0`; the first two parts are each limited to 240 characters, using only letters, digits, underscores, hyphens, and dots |
-| `startCharacter` | No | Default 0; nonnegative safe integer, a Unicode code-point offset in the complete visible text |
-
-```json
-{
-  "id": "fixture-session:entry-a:0"
-}
-```
-
-Exact ID reads do not require the source to appear on the previous search page. Returns source metadata plus `text`, `startCharacter`, and `nextCharacter`. Each page's `text` is at most 8 KiB UTF-8. The `hash` covers the complete visible text, not the page. When `nextCharacter` is non-null, keep the ID unchanged and use that value for the next `startCharacter` until null is returned. Do not calculate positions from UTF-8 byte counts or JavaScript UTF-16 indexes.
-
-### Read scope and evidentiary meaning
-
-The session header's actual `cwd` must belong to the current canonical project identity. The initiating session uses the visible active branch captured when the pass starts, including context edits present then; later changes appear in later passes. Historical files are read on demand using the final record's parent-chain branch. Other branches are not read by default. Messages still retained from before compaction are accessible. Messages deleted by `context_edit` are not returned. Replacements return only the replacement text, marked with `contextEdited: true` and `evidence: "context-edited"`. Hashes always cover the complete visible text containing the returned range. Edited content cannot be used to claim verification of the original feedback.
-
-Sources contain only user, assistant, and ordinary tool-result text, excluding this extension's own memory-tool results. Thinking, signatures, images, custom messages, system prompts, and tool-call arguments are not returned. Identical entries copied into forks share a `duplicateKey` and are deduplicated within a search page, but their reappearance across pages still cannot count as independent evidence. User statements, assistant judgments, and tool observations must not be treated as the same kind of proof either.
-
-Native files are read-only and must use Pi v3 session format. Headers are limited to 16 KiB, and each session to 16 MiB and 100000 records. Discovery is limited to 512 directories, 20000 entries per directory, and 20000 native session files in total, scanning only host session roots and one subdirectory level. Corrupt, oversized, or unsafe files are rejected and reported. If a source is unavailable, retain an unverified qualification rather than bypassing project, branch, or edit boundaries.
-
-Background memory tools allow only `project`. They cannot read or write global memory or execute tests. See the [design](design.md#bounded-independent-dreaming) for calls, costs, budgets, and cancellation behavior.
+The maintenance prompt restricts the task to project memory: read sessions and source code without modifying them, use memory tools for safe note writes, check evidence, and treat historical instructions as untrusted data rather than authorization. These are prompt instructions, **not an OS sandbox or a tool allowlist**. The Agent's normal tools can access files, execute commands, and use configured network-capable tools. Do not enable automatic dreaming unless this authority and historical-data exposure are acceptable. See the [user guide](usage.md#privacy-and-usage-notes) and [design](design.md#independent-dreaming-agent) for lifecycle, costs, and run logs.
 
 ## Output and errors
 

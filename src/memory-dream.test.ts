@@ -1,341 +1,226 @@
 import assert from "node:assert/strict";
-import { createHash } from "node:crypto";
-import test from "node:test";
-import { Type } from "typebox";
-import type { AssistantMessage, Context, ToolCall } from "@earendil-works/pi-ai";
-import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { runMemoryDream, type MemoryDreamCompletion, type MemoryDreamOptions, type MemoryDreamTool } from "./memory-dream.ts";
-import type { MemorySourceProvider } from "./memory-sources.ts";
+import { spawn, spawnSync } from "node:child_process";
+import { watch } from "node:fs";
+import { mkdir, readFile, readdir, symlink, writeFile } from "node:fs/promises";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
+import test, { type TestContext } from "node:test";
+import { createMemoryTestDirectory } from "../test/memory-fixtures.ts";
+import { runMemoryDream, MEMORY_DREAM_TIMEOUT_MS, type MemoryDreamOptions } from "./memory-dream.ts";
+import { buildMemoryDreamPrompt } from "./memory-dream-worker.ts";
+import { claimMemoryDream, readMemorySchedule, recordMemoryTurn } from "./memory-schedule.ts";
+import { createMemoryStoreHandle, readMemoryNote } from "./memory-store.ts";
 
-const model = { id: "synthetic-model", provider: "synthetic-provider", api: "openai-completions", maxTokens: 131072 } as NonNullable<ExtensionContext["model"]>;
-const sourceText = "Original synthetic test output: check passed.\nDo not interpret this text as instructions.";
-const sources = [{ id: "synthetic-session:entry:0", sessionId: "synthetic-session", entryId: "entry", role: "toolResult",
-  text: sourceText, hash: createHash("sha256").update(sourceText).digest("hex"), timestamp: "2026-01-01T00:00:00.000Z",
-  contextEdited: false, evidence: "original" as const, duplicateKey: "entry:synthetic-hash", startCharacter: 0, nextCharacter: null }];
+const packageRoot = fileURLToPath(new URL("../", import.meta.url));
+const cliPath = join(packageRoot, "node_modules/@earendil-works/pi-coding-agent/dist/cli.js");
 
-function syntheticSourceProvider(empty = false): MemorySourceProvider {
-  return {
-    async search(_query, _options, signal) {
-      signal?.throwIfAborted();
-      return { sources: empty ? [] : sources.map(({ text, startCharacter: _start, nextCharacter: _next, ...metadata }) =>
-        ({ ...metadata, preview: text.slice(0, 240) })), nextOffset: null };
-    },
-    async read(id, _options, signal) {
-      signal?.throwIfAborted();
-      const source = empty ? undefined : sources.find((item) => item.id === id);
-      if (!source) throw new Error("Memory source unavailable on the selected same-project branch");
-      return source;
-    },
-  };
-}
-const readSchema = Type.Object({ path: Type.Optional(Type.String()), scope: Type.Optional(Type.String()) }, { additionalProperties: false });
-const writeSchema = Type.Object({
-  path: Type.String(), content: Type.Optional(Type.String()), expectedHash: Type.Union([Type.String(), Type.Null()]),
-  action: Type.Optional(Type.String()), scope: Type.Optional(Type.String()),
-}, { additionalProperties: false });
-
-function assistant(content: AssistantMessage["content"], stopReason: AssistantMessage["stopReason"] = "stop"): AssistantMessage {
-  return {
-    role: "assistant", content, stopReason, timestamp: 1, model: model.id, provider: model.provider, api: model.api,
-    usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
-  };
-}
-
-function call(name: string, args: ToolCall["arguments"] = {}, id = name): ToolCall {
-  return { type: "toolCall", id, name, arguments: args };
-}
-
-function textResult(text: string, isError = false) {
-  return { content: [{ type: "text" as const, text }], details: {}, isError };
-}
-
-function harness(responses: AssistantMessage[]) {
-  const contexts: Context[] = [];
-  const writes: Record<string, unknown>[] = [];
-  const tools: MemoryDreamTool[] = [
-    { name: "memory_search", description: "Search project notes", parameters: Type.Object({}, { additionalProperties: false }), async execute() { return textResult("Existing notes: notes/test.md"); } },
-    { name: "memory_read", description: "Read project Markdown", parameters: readSchema, async execute() { return textResult("# Note\nOriginal note; hash=synthetic-hash"); } },
-    { name: "memory_write", description: "Write project Markdown", parameters: writeSchema, async execute(_id, args, signal) { signal?.throwIfAborted(); writes.push(args); return textResult("Written"); } },
-  ];
-  let completions = 0;
-  const complete: MemoryDreamCompletion = async (actualModel, context, request) => {
-    assert.equal(actualModel, model);
-    assert.equal(request.maxTokens, 65536);
-    assert.ok(request.signal instanceof AbortSignal);
-    contexts.push(structuredClone(context));
-    const result = responses[completions++];
-    assert.ok(result, "Unexpected model call");
-    return result;
-  };
+async function harness(ctx: TestContext, count = 50) {
+  const directory = await createMemoryTestDirectory(ctx);
+  const project = join(directory, "project");
+  await mkdir(project);
+  const source = join(directory, "source.jsonl");
+  await writeFile(source, JSON.stringify({ type: "session", version: 3, id: "synthetic-source-session", cwd: project }) + "\n" +
+    JSON.stringify({ id: "user-0", type: "message", message: { role: "user", content: "SYNTHETIC_VERIFIED_FEEDBACK" } }) + "\n");
   const options: MemoryDreamOptions = {
-    model, sourceProvider: syntheticSourceProvider(), tools, complete,
-    // A deliberately inert registry: these tests never discover resources or contact a provider.
-    modelRegistry: {} as ExtensionContext["modelRegistry"],
+    handle: createMemoryStoreHandle(join(directory, "memory"), project, "project"),
+    model: { provider: "memory-dream-test", id: "scripted" }, agentDir: join(directory, "agent"),
+    sessionRoots: [directory], thinkingLevel: "off",
   };
-  return { options, contexts, writes, tools, get completions() { return completions; } };
+  for (let index = 0; index < count; index++) {
+    await recordMemoryTurn(options.handle, { sessionId: "synthetic-source-session", entryId: `user-${index}`, sessionFile: source });
+  }
+  return { directory, options, source };
 }
 
-const done = () => assistant([{ type: "text", text: "Organized notes; evidence limitations retained." }]);
+async function runDirectory(options: MemoryDreamOptions) {
+  const root = join(options.handle.directory, ".dream-runs");
+  const names = await readdir(root);
+  assert.equal(names.length, 1);
+  return join(root, names[0]);
+}
 
-test("dream uses an independent tool transcript, reads exact original evidence, and writes the small MEMORY.md index", async () => {
-  const response = assistant([
-    { type: "thinking", thinking: "opaque synthetic private block", thinkingSignature: "opaque-signature" },
-    call("memory_source", { id: sources[0].id }, "source-call"), call("memory_read", { path: "notes/test.md" }, "note-call"),
-  ], "toolUse");
-  const h = harness([response, assistant([
-    call("memory_write", { path: "notes/test.md", content: `# Tested lesson\nObserved check passed. Source: ${sources[0].id}`, expectedHash: "synthetic-hash" }, "note-write"),
-    call("memory_write", { path: "MEMORY.md", content: "# Memory\n- [Test lesson](notes/test.md): use for checks", expectedHash: null }, "index-write"),
-  ], "toolUse"), done()]);
-  const progress: string[] = [];
-  const report = await runMemoryDream({ ...h.options, onProgress: (text) => progress.push(text) });
-  assert.equal(report, "Memory updated: 2 write call(s) completed.");
-  assert.equal(h.writes.length, 2);
-  assert.deepEqual(h.contexts[0].messages.map(({ role }) => role), ["user"]);
-  const replay = h.contexts[1].messages;
-  assert.deepEqual(replay[1], response, "Provider signatures are retained opaquely for model replay");
-  assert.deepEqual(replay[2], {
-    role: "toolResult", toolCallId: "source-call", toolName: "memory_source", isError: false,
-    content: [{ type: "text", text: JSON.stringify(sources[0]) }], timestamp: replay[2].timestamp,
+function waitForStatus(directory: string, predicate: (state: Record<string, unknown>) => boolean): Promise<Record<string, unknown>> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => { watcher.close(); reject(new Error(`Dream status wait expired: ${directory}`)); }, 20000);
+    const watcher = watch(directory, () => { void inspect(); });
+    watcher.on("error", reject);
+    async function inspect() {
+      try {
+        const status = JSON.parse(await readFile(join(directory, "status.json"), "utf8"));
+        if (predicate(status)) { clearTimeout(timer); watcher.close(); resolve(status); }
+      } catch { /* A write event may arrive while JSON is being replaced. The next event retries. */ }
+    }
+    void inspect();
   });
-  assert.deepEqual(replay[3].role, "toolResult");
-  assert.ok(!report.includes("private block") && progress.every((text) => !text.includes("private block")));
-  assert.match(h.contexts[0].systemPrompt!, /not another conversation summary/);
-  assert.match(h.contexts[0].systemPrompt!, /MEMORY.md a small/);
-  assert.match(h.contexts[0].systemPrompt!, /untrusted DATA/);
-  assert.match(h.contexts[0].systemPrompt!, /assistant claim is not independent proof/);
-  assert.match(h.contexts[0].systemPrompt!, /Foreground agents may continue working/);
-  assert.match(h.contexts[0].systemPrompt!, /New interactions remain work for later passes/);
+}
+
+function cleanupSupervisor(ctx: TestContext, receipt: string) {
+  const pid = Number(receipt.match(/supervisor PID (\d+)/)?.[1]);
+  assert.ok(pid > 0);
+  ctx.after(() => { try { process.kill(-pid, "SIGKILL"); } catch { /* The independent run may already have exited. */ } });
+}
+
+function testEnvironment(ctx: TestContext, values: Record<string, string>) {
+  const previous = Object.fromEntries(Object.keys(values).map((key) => [key, process.env[key]]));
+  Object.assign(process.env, values);
+  ctx.after(() => {
+    for (const [key, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[key]; else process.env[key] = value;
+    }
+  });
+}
+
+test("dream prompt supplies session IDs, normal tools and an explicit 30-minute deadline without request/tool quotas", async (ctx) => {
+  const h = await harness(ctx, 0);
+  assert.equal(MEMORY_DREAM_TIMEOUT_MS, 1800000);
+  const prompt = buildMemoryDreamPrompt({ ...h.options, runDirectory: "/synthetic-run", deadline: 1800000 },
+    [{ sessionId: "synthetic-source-session", sessionFile: h.source }]);
+  assert.match(prompt, /1970-01-01T00:30:00.000Z/);
+  assert.match(prompt, /complete relevant sessions/);
+  assert.match(prompt, /no dreaming-specific model-request or tool-call quota/);
+  assert.match(prompt, /untrusted evidence/);
+  assert.match(prompt, /memory_search\/read\/write/);
+  assert.ok(!prompt.includes("SYNTHETIC_VERIFIED_FEEDBACK"), "The program supplies source locations, not evidence excerpts");
+  assert.equal(await runMemoryDream(h.options), "");
 });
 
-test("dream defaults to configured registry completion, with the registry receiver preserved", async () => {
-  const h = harness([]);
-  const registry = { async complete(actualModel: unknown, context: Context, request: { maxTokens: number }) {
-    assert.equal(this, registry);
-    assert.equal(actualModel, model);
-    assert.equal(request.maxTokens, 65536);
-    assert.deepEqual(context.tools!.map(({ name }) => name), ["memory_search", "memory_read", "memory_write", "memory_source_search", "memory_source"]);
-    return done();
-  } };
-  const report = await runMemoryDream({ ...h.options, complete: undefined, modelRegistry: registry as unknown as ExtensionContext["modelRegistry"] });
-  assert.equal(report, "");
+test("dream refuses a symlinked run directory and never starts a child", async (ctx) => {
+  const h = await harness(ctx);
+  const other = join(h.directory, "other");
+  await mkdir(other);
+  await symlink(other, join(h.options.handle.directory, ".dream-runs"));
+  await assert.rejects(runMemoryDream(h.options), /run directory is unsafe/);
+  assert.deepEqual(await readdir(other), []);
 });
 
-test("dream reports unavailable source, unknown tools, schema errors, global scope, and unauthorized actions as tool errors", async () => {
-  const h = harness([assistant([
-    call("memory_source", { id: "other-session:hidden" }, "missing-source"),
-    call("bash", { command: "not executed" }),
-    call("memory_source", { id: 42 }, "invalid-source"),
-    call("memory_read", { scope: "global" }),
-    call("memory_write", { path: "MEMORY.md", content: "not written", expectedHash: null, action: "verify" }),
-  ], "toolUse"), done()]);
-  await runMemoryDream(h.options);
-  const results = h.contexts[1].messages.filter((message) => message.role === "toolResult");
-  assert.equal(results.length, 5);
-  assert.ok(results.every((message) => message.isError));
-  assert.match(JSON.stringify(results), /unavailable.*same-project branch/);
-  assert.match(JSON.stringify(results), /project-only/);
-  assert.equal(h.writes.length, 0);
-});
-
-test("dream passes thrown and returned tool errors to the model without counting them as successful writes", async () => {
-  const h = harness([assistant([call("memory_read"), call("memory_write", { path: "MEMORY.md", expectedHash: null })], "toolUse"), done()]);
-  h.tools[1].execute = async () => { throw new Error("synthetic read conflict"); };
-  h.tools[2].execute = async () => textResult("synthetic write conflict", true);
-  const report = await runMemoryDream(h.options);
-  assert.equal(report, "");
-  assert.ok(h.contexts[1].messages.filter((message) => message.role === "toolResult").every((result) => result.isError));
-});
-
-test("dream allows a completion report on response 32 after exactly 64 tool calls", async () => {
-  const h = harness([
-    ...Array.from({ length: 31 }, (_, i) => assistant(
-      Array.from({ length: i === 0 ? 4 : 2 }, (_, j) => call("memory_read", {}, `read-${i}-${j}`)), "toolUse")),
-    done(),
-  ]);
-  const report = await runMemoryDream(h.options);
-  assert.equal(report, "");
-  assert.equal(h.completions, 32);
-  assert.equal(h.contexts[31].messages.filter((message) => message.role === "toolResult").length, 64);
-  assert.match(h.contexts[0].systemPrompt!, /32 model responses, 64 total tool calls, 65536 output tokens per response .* and 300 seconds/);
-});
-
-test("dream fails on the 32nd tool-using model response rather than claiming completion", async () => {
-  const h = harness(Array.from({ length: 32 }, (_, i) => assistant([call("memory_read", {}, `read-${i}`)], "toolUse")));
-  await assert.rejects(runMemoryDream(h.options), /response budget exhausted \(32\).*reflection incomplete/);
-  assert.equal(h.completions, 32);
-});
-
-test("dream caps output at the selected model limit when lower than 64k", async () => {
-  const h = harness([]);
-  await runMemoryDream({ ...h.options, model: { ...model, maxTokens: 8192 }, complete: async (_model, _context, request) => {
-    assert.equal(request.maxTokens, 8192);
-    return done();
-  } });
-});
-
-test("dream enforces the 64 tool budget before dispatching an overflowing batch", async () => {
-  const h = harness([
-    assistant(Array.from({ length: 64 }, (_, i) => call("memory_read", {}, `read-${i}`)), "toolUse"),
-    assistant([call("memory_write", { path: "MEMORY.md", expectedHash: null })], "toolUse"),
-  ]);
-  await assert.rejects(runMemoryDream(h.options), /tool call budget exhausted \(64\)/);
-  assert.equal(h.writes.length, 0);
-  assert.equal(h.completions, 2);
-});
-
-test("dream rejects provider truncation, aborted/error/deferred responses, and empty visible reports", async () => {
-  for (const stopReason of ["length", "aborted", "error", "deferred", "pending"] as const) {
-    const h = harness([assistant([], stopReason)]);
-    await assert.rejects(runMemoryDream(h.options), /model did not finish normally/);
-  }
-  const h = harness([assistant([{ type: "thinking", thinking: "not a report" }])]);
-  await assert.rejects(runMemoryDream(h.options), /no visible completion report/);
-});
-
-test("dream aborts before provider work and while a provider ignores cancellation", async () => {
-  const h = harness([done()]);
-  const before = new AbortController();
-  before.abort(new Error("synthetic pre-abort"));
-  await assert.rejects(runMemoryDream({ ...h.options, signal: before.signal }), /synthetic pre-abort/);
-  assert.equal(h.completions, 0);
-  const during = new AbortController();
-  const pending = runMemoryDream({ ...h.options, signal: during.signal, complete: async () => new Promise(() => {}) });
-  during.abort(new Error("synthetic active abort"));
-  await assert.rejects(pending, /synthetic active abort.*0 write call/);
-});
-
-test("dream timeout reports completed writes and an uncertain in-flight write without rolling back", async (testCtx) => {
-  testCtx.mock.timers.enable({ apis: ["setTimeout"] });
-  const h = harness([assistant([
-    call("memory_write", { path: "notes/saved.md", content: "saved", expectedHash: null }, "saved"),
-    call("memory_write", { path: "notes/pending.md", content: "pending", expectedHash: null }, "pending"),
-  ], "toolUse")]);
-  let markEntered!: () => void;
-  const entered = new Promise<void>((resolve) => { markEntered = resolve; });
-  let writeCount = 0;
-  let toolSignal: AbortSignal | undefined;
-  h.tools[2].execute = async (_id, _args, signal) => {
-    toolSignal = signal;
-    if (++writeCount === 1) return textResult("saved");
-    markEntered();
-    return new Promise(() => {});
-  };
-  const pending = runMemoryDream(h.options);
-  await entered;
-  const rejected = assert.rejects(pending, /timeout after 300 seconds.*1 write call\(s\) completed.*in flight.*may still complete/);
-  testCtx.mock.timers.tick(299_999);
-  assert.equal(toolSignal?.aborted, false, "The task remains live beyond the old 90-second limit");
-  testCtx.mock.timers.tick(1);
-  await rejected;
-  assert.equal(toolSignal?.aborted, true);
-  assert.equal(writeCount, 2);
-});
-
-test("dream rejects unauthorized tools before invoking the model", async () => {
-  const h = harness([done()]);
-  await assert.rejects(runMemoryDream({ ...h.options, tools: [...h.tools, { ...h.tools[0], name: "bash" }] }), /unique memory_search\/read\/write/);
-  assert.equal(h.completions, 0);
-});
-
-test("dream forwards historical search cursors and exact-source Unicode paging without inventing a preview window", async () => {
-  const h = harness([assistant([
-    call("memory_source_search", { query: "old feedback", sessionId: "old-session", offset: 700003, limit: 3 }, "search"),
-    call("memory_source", { id: "old-session:old-entry:0", startCharacter: 2048 }, "old-source"),
-  ], "toolUse"), done()]);
-  const requests: unknown[] = [];
-  const searchPage = { sources: [], nextOffset: 800008, partial: true, warnings: ["synthetic scan continuation"] };
-  const readPage = { ...sources[0], id: "old-session:old-entry:0", sessionId: "old-session", entryId: "old-entry",
-    startCharacter: 2048, text: "historical source page 中文", nextCharacter: 2068, contextEdited: true,
-    evidence: "context-edited" as const, sourceFile: "/synthetic/sessions/old.jsonl", sourceLine: 2 };
-  const sourceProvider: MemorySourceProvider = {
-    async search(query, options, signal) { assert(signal instanceof AbortSignal); requests.push({ query, options }); return searchPage; },
-    async read(id, options, signal) { assert(signal instanceof AbortSignal); requests.push({ id, options }); return readPage; },
-  };
-  await runMemoryDream({ ...h.options, sourceProvider });
-  assert.deepEqual(requests, [
-    { query: "old feedback", options: { sessionId: "old-session", offset: 700003, limit: 3 } },
-    { id: "old-session:old-entry:0", options: { startCharacter: 2048 } },
-  ]);
-  const results = h.contexts[1].messages.filter((message) => message.role === "toolResult");
-  assert.equal(results[0].content[0].type, "text");
-  if (results[0].content[0].type !== "text" || results[1].content[0].type !== "text") throw new Error("Missing source tool output");
-  assert.deepEqual(JSON.parse(results[0].content[0].text), searchPage);
-  assert.deepEqual(JSON.parse(results[1].content[0].text), readPage);
-  assert.match(h.contexts[0].systemPrompt!, /pre-compaction/);
-  assert.match(h.contexts[0].systemPrompt!, /Duplicate keys/);
-  assert.match(h.contexts[0].systemPrompt!, /nextOffset even on empty search pages/);
-});
-
-test("dream rejects arbitrary paths, extra source arguments, and invalid pagination through tool schemas", async () => {
-  const h = harness([assistant([
-    call("memory_source_search", { query: "x", path: "/not-authorized" }, "path"),
-    call("memory_source_search", { offset: -1 }, "offset"),
-    call("memory_source_search", { limit: 21 }, "limit"),
-    call("memory_source", { id: sources[0].id, startCharacter: -1 }, "character"),
-  ], "toolUse"), done()]);
-  let providerCalls = 0;
-  const sourceProvider: MemorySourceProvider = {
-    async search() { providerCalls++; throw new Error("must not dispatch"); },
-    async read() { providerCalls++; throw new Error("must not dispatch"); },
-  };
-  await runMemoryDream({ ...h.options, sourceProvider });
-  assert.equal(providerCalls, 0);
-  const results = h.contexts[1].messages.filter((message) => message.role === "toolResult");
-  assert.equal(results.length, 4);
-  assert(results.every((result) => result.isError));
-});
-
-test("dream can organize uncertain notes without sources and bounds ordinary tool output", async () => {
-  const h = harness([assistant([call("memory_read", { path: "MEMORY.md" })], "toolUse"), done()]);
-  h.tools[1].execute = async () => textResult("a".repeat(60 * 1024));
-  await runMemoryDream({ ...h.options, sourceProvider: syntheticSourceProvider(true) });
-  const result = h.contexts[1].messages[2];
-  assert.equal(result.role, "toolResult");
-  if (result.role !== "toolResult") throw new Error("Missing test tool result");
-  assert.match(JSON.stringify(result.content), /truncated at 50 KiB/);
-  assert.ok(JSON.stringify(result.content).length < 52 * 1024);
-});
-
-test("dream adaptively shrinks oversized escaped source-search JSON without dropping cursor IDs", async () => {
-  const startOffset = 700000;
-  const h = harness([
-    assistant([call("memory_source_search", { query: "quoted evidence", offset: startOffset }, "first-page")], "toolUse"),
-    assistant([call("memory_source_search", { query: "quoted evidence", offset: startOffset + 5 }, "second-page")], "toolUse"),
-    done(),
-  ]);
-  const requests: { query: string; offset: number | undefined; limit: number | undefined; bytes: number }[] = [];
-  const { text: _text, startCharacter: _start, nextCharacter: _next, ...metadata } = sources[0];
-  const catalog = Array.from({ length: 30 }, (_, index) => ({ ...metadata, id: `synthetic-session:entry-${index}:0`,
-    entryId: `entry-${index}`, preview: "\n".repeat(240), sourceFile: `/${"\\".repeat(3000)}/synthetic.jsonl`, sourceLine: index + 2 }));
-  const sourceProvider: MemorySourceProvider = {
-    async search(query, options, signal) {
-      signal?.throwIfAborted();
-      const offset = options?.offset ?? startOffset;
-      const limit = options?.limit ?? 10;
-      const index = offset - startOffset;
-      const page = { sources: catalog.slice(index, index + limit), nextOffset: offset + limit, partial: true };
-      requests.push({ query, offset: options?.offset, limit: options?.limit, bytes: Buffer.byteLength(JSON.stringify(page)) });
-      return page;
+test("detached supervisor enforces its own deadline even when a worker ignores graceful shutdown", { timeout: 10000 }, async (ctx) => {
+  const h = await harness(ctx);
+  const fakeCli = join(h.directory, "hung-worker.cjs");
+  await writeFile(fakeCli, 'process.on("SIGTERM", () => {}); setInterval(() => {}, 1000);');
+  let exited!: Promise<NodeJS.Signals | null>;
+  const receipt = await runMemoryDream(h.options, { cliPath: fakeCli, timeoutMs: 500, killGraceMs: 50,
+    spawn(command, args, options) {
+      const child = spawn(command, args, options);
+      exited = new Promise((resolve) => { child.once("exit", (_code, signal) => resolve(signal)); });
+      return child;
     },
-    async read() { throw new Error("Exact source read was not requested"); },
-  };
-  await runMemoryDream({ ...h.options, sourceProvider });
-  assert.deepEqual(requests.map(({ query, offset, limit }) => ({ query, offset, limit })), [
-    { query: "quoted evidence", offset: startOffset, limit: 10 },
-    { query: "quoted evidence", offset: startOffset, limit: 5 },
-    { query: "quoted evidence", offset: startOffset + 5, limit: 10 },
-    { query: "quoted evidence", offset: startOffset + 5, limit: 5 },
-  ]);
-  assert(requests[0].bytes > 50 * 1024 && requests[1].bytes <= 50 * 1024);
-  const pages = [h.contexts[1], h.contexts[2]].map((context) => {
-    const result = context.messages.filter((message) => message.role === "toolResult").at(-1)!;
-    assert.equal(result.isError, false);
-    const block = result.content[0];
-    if (block.type !== "text") throw new Error("Missing source search JSON output");
-    assert(Buffer.byteLength(block.text) <= 50 * 1024);
-    return JSON.parse(block.text) as { sources: { id: string }[]; nextOffset: number };
   });
-  assert.equal(pages[0].nextOffset, startOffset + 5);
-  assert.equal(pages[1].nextOffset, startOffset + 10);
-  assert.deepEqual(pages.flatMap((page) => page.sources.map((source) => source.id)), catalog.slice(0, 10).map((source) => source.id));
+  cleanupSupervisor(ctx, receipt);
+  const directory = await runDirectory(h.options);
+  const status = await waitForStatus(directory, (state) => state.state === "timed_out");
+  assert.match(String(status.error), /wall-clock deadline/);
+  assert.equal(await exited, "SIGKILL", "The independent supervisor actually enforces its hard-kill grace");
+  assert.equal(JSON.parse(await readFile(join(directory, "status.json"), "utf8")).state, "timed_out");
+  assert.equal((await readMemorySchedule(h.options.handle)).pendingTurns, 50);
+});
+
+for (const workerShutdown of ["exits", "ignores"] as const) {
+  test(`detached supervisor kills captured tool descendants when the worker ${workerShutdown} on SIGTERM`, { timeout: 10000 }, async (ctx) => {
+    const h = await harness(ctx);
+    const fakeCli = join(h.directory, "detached-tool-worker.cjs");
+    const toolPidPath = join(h.directory, "tool.pid");
+    await writeFile(fakeCli, `const { spawn } = require("node:child_process");
+const { writeFileSync } = require("node:fs");
+const tool = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { detached: true, stdio: "ignore" });
+writeFileSync(${JSON.stringify(toolPidPath)}, String(tool.pid));
+process.on("SIGTERM", () => { ${workerShutdown === "exits" ? "process.exit(0);" : ""} });
+setInterval(() => {}, 1000);`);
+    // A separate process outside the supervisor tree must never be targeted.
+    const unrelated = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { detached: true, stdio: "ignore" });
+    await new Promise<void>((resolve, reject) => { unrelated.once("spawn", resolve); unrelated.once("error", reject); });
+    ctx.after(() => { try { process.kill(-unrelated.pid!, "SIGKILL"); } catch { /* Synthetic unrelated process already exited. */ } });
+    let supervisor!: ReturnType<typeof spawn>;
+    let exited!: Promise<void>;
+    ctx.after(async () => {
+      try { process.kill(-Number(await readFile(toolPidPath, "utf8")), "SIGKILL"); } catch { /* Synthetic tool already stopped. */ }
+    });
+    const receipt = await runMemoryDream(h.options, { cliPath: fakeCli, timeoutMs: 1000, killGraceMs: 100,
+      spawn(command, args, options) {
+        supervisor = spawn(command, args, options);
+        exited = new Promise((resolve) => { supervisor.once("exit", () => resolve()); });
+        return supervisor;
+      },
+    });
+    supervisor.ref();
+    cleanupSupervisor(ctx, receipt);
+    await exited;
+    const toolPid = Number(await readFile(toolPidPath, "utf8"));
+    const state = spawnSync("/bin/ps", ["-p", String(toolPid), "-o", "stat="], { encoding: "utf8" });
+    assert.ok(!state.error && (state.status === 0 || state.status === 1), "The process-state probe must run");
+    // A reparented zombie is dead but may await its new parent's reap, especially in containers.
+    assert.match(state.stdout.trim(), /^(Z.*)?$/, "Detached tools must not survive the hard deadline, even after reparenting");
+    assert.doesNotThrow(() => process.kill(unrelated.pid!, 0), "Unrelated process identities must remain untouched");
+    assert.equal(JSON.parse(await readFile(join(await runDirectory(h.options), "status.json"), "utf8")).state, "timed_out");
+  });
+}
+
+test("detached dream continues after its launching foreground process exits", { timeout: 10000 }, async (ctx) => {
+  const h = await harness(ctx);
+  const fakeCli = join(h.directory, "independent-worker.cjs");
+  await writeFile(fakeCli, `const fs = require("node:fs"); const path = require("node:path");
+const config = JSON.parse(process.env.PI_MEMORY_DREAM_CONFIG);
+setTimeout(() => { let foregroundGone = false; try { process.kill(Number(process.env.PI_MEMORY_TEST_PARENT_PID), 0); } catch { foregroundGone = true; }
+fs.writeFileSync(path.join(config.runDirectory,"status.json"), JSON.stringify({state:"completed",foregroundGone})); }, 300);`);
+  const launcher = fileURLToPath(new URL("./memory-dream.ts", import.meta.url));
+  const parent = spawnSync(process.execPath, ["--experimental-strip-types", "--input-type=module", "-e",
+    `import { runMemoryDream } from ${JSON.stringify(launcher)}; process.env.PI_MEMORY_TEST_PARENT_PID = String(process.pid); console.log(await runMemoryDream(${JSON.stringify(h.options)}, { cliPath: ${JSON.stringify(fakeCli)} }));`],
+  { cwd: h.options.handle.identity, encoding: "utf8", timeout: 5000 });
+  assert.equal(parent.status, 0, parent.stderr);
+  assert.match(parent.stdout, /not a completion receipt/);
+  cleanupSupervisor(ctx, parent.stdout);
+  const status = await waitForStatus(await runDirectory(h.options), (state) => state.state === "completed");
+  assert.equal(status.foregroundGone, true);
+});
+
+test("real isolated Pi dream reads raw synthetic sessions with normal tools and exceeds former request/tool budgets offline", { timeout: 25000 }, async (ctx) => {
+  const h = await harness(ctx);
+  const trace = join(h.directory, "trace.jsonl");
+  const original = await readFile(h.source, "utf8");
+  testEnvironment(ctx, { PI_OFFLINE: "1", PI_SKIP_VERSION_CHECK: "1", PI_TELEMETRY: "0", JITI_FS_CACHE: "false",
+    PI_MEMORY_TEST_TRACE: trace, PI_MEMORY_TEST_SOURCE: h.source });
+  const receipt = await runMemoryDream(h.options, { cliPath, cliArgs: ["--offline", "--approve", "--no-extensions", "--no-mcp", "--no-skills",
+    "--no-prompt-templates", "--no-context-files", "--no-session", "-e", join(packageRoot, "test/memory-dream-provider.ts")] });
+  cleanupSupervisor(ctx, receipt);
+  const directory = await runDirectory(h.options);
+  const status = await waitForStatus(directory, (state) => ["completed", "failed"].includes(String(state.state)));
+  assert.equal(status.state, "completed", JSON.stringify(status) + "\n" + await readFile(join(directory, "supervisor.log"), "utf8") + "\n" + (await readFile(join(directory, "events.jsonl"), "utf8")).slice(-16000));
+  const calls = (await readFile(trace, "utf8")).trim().split("\n").map((line) => JSON.parse(line));
+  assert.ok(calls.length > 32, `Observed ${calls.length} model calls`);
+  assert.ok(calls.at(-1).results > 64);
+  assert.match((await readMemoryNote(h.options.handle, "lessons.md"))?.content ?? "", /SYNTHETIC_VERIFIED_FEEDBACK/);
+  assert.match((await readMemoryNote(h.options.handle, "MEMORY.md"))?.content ?? "", /lessons.md/);
+  assert.equal((await readMemorySchedule(h.options.handle)).pendingTurns, 0);
+  assert.equal(await readFile(h.source, "utf8"), original);
+});
+
+test("isolated CLI claim-lock failure starts no unassigned model request", { timeout: 15000 }, async (ctx) => {
+  const h = await harness(ctx);
+  const trace = join(h.directory, "trace.jsonl");
+  testEnvironment(ctx, { PI_OFFLINE: "1", PI_SKIP_VERSION_CHECK: "1", PI_TELEMETRY: "0", JITI_FS_CACHE: "false",
+    PI_MEMORY_TEST_TRACE: trace, PI_MEMORY_TEST_SOURCE: h.source });
+  await mkdir(`${h.options.handle.directory}.lock`);
+  let exited!: Promise<void>;
+  const receipt = await runMemoryDream(h.options, { cliPath,
+    cliArgs: ["--offline", "--approve", "--no-extensions", "--no-mcp", "--no-skills", "--no-prompt-templates",
+      "--no-context-files", "--no-session", "-e", join(packageRoot, "test/memory-dream-provider.ts")],
+    spawn(command, args, options) {
+      const child = spawn(command, args, options);
+      exited = new Promise((resolve) => { child.once("exit", () => resolve()); });
+      return child;
+    },
+  });
+  cleanupSupervisor(ctx, receipt);
+  const directory = await runDirectory(h.options);
+  const status = await waitForStatus(directory, (state) => state.state === "failed");
+  await exited;
+  assert.equal(status.state, "failed");
+  await assert.rejects(readFile(trace), { code: "ENOENT" }, "No provider request may run without a successful claim");
+  assert.equal((await readMemorySchedule(h.options.handle)).pendingTurns, 50);
+});
+
+test("an active project dream lease suppresses extra supervisors before creating run artifacts", async (ctx) => {
+  const h = await harness(ctx);
+  assert.ok(await claimMemoryDream(h.options.handle, { ownerId: "existing-project-worker" }));
+  assert.equal(await runMemoryDream(h.options), "");
+  assert.ok(!(await readdir(h.options.handle.directory)).includes(".dream-runs"));
 });
