@@ -9,6 +9,7 @@ Cross-session Markdown memory for Pi. Ask the agent to remember useful knowledge
 - Reuse knowledge across sessions: retain project conventions and lessons from past work, then look them up in a new conversation.
 - Separate project and global memory: keep project details isolated and share nonprivate preferences or knowledge across projects when appropriate.
 - Let the agent manage notes: search, read, update, and archive local Markdown without writing tool arguments yourself.
+- Look up past conversations from the same project when notes lack a detail.
 - Maintain memory in the background: review the same project's history to find missed lessons, correct or merge notes, and keep the index useful.
 
 ## Install

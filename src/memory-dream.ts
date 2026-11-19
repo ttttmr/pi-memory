@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { getPackageDir } from "@earendil-works/pi-coding-agent";
 import { watchMemoryDreamStatus, type MemoryDreamNotification } from "./memory-dream-notifications.ts";
+import { isGlobalMemoryDreamDue, markGlobalMemoryDreamLaunch } from "./memory-global-schedule.ts";
 import { hasActiveMemoryDream, readMemorySchedule } from "./memory-schedule.ts";
 import type { MemoryStoreHandle } from "./memory-store.ts";
 
@@ -24,6 +25,8 @@ export interface MemoryDreamOptions {
 export interface MemoryDreamWorkerConfig extends MemoryDreamOptions {
   runDirectory: string;
   deadline: number;
+  /** Project passes run in the project; global passes run in their own run directory, loading no project resources. */
+  workerCwd: string;
 }
 
 interface MemoryDreamLaunchDependencies {
@@ -114,7 +117,7 @@ const deadlineTimer = setTimeout(() => {
   }, launch.killGraceMs);
 }, Math.max(0, config.deadline - Date.now()));
 try {
-  child = spawn(process.execPath, launch.args, { cwd: config.handle.identity, env: process.env, stdio: ["ignore", events, "inherit"] });
+  child = spawn(process.execPath, launch.args, { cwd: config.workerCwd, env: process.env, stdio: ["ignore", events, "inherit"] });
   status("starting", { supervisorPid: process.pid, workerPid: child.pid });
   child.on("error", error => { status("failed", { error: error.message }); clearTimeout(deadlineTimer); process.exitCode = 1; });
   child.on("close", (code, signal) => {
@@ -137,16 +140,19 @@ try {
 } finally { closeSync(events); }
 `;
 
-/** Start a detached project dream; the receipt confirms launch only, never memory completion. */
+/** Start a detached project or global dream; the receipt confirms launch only, never memory completion. */
 export async function runMemoryDream(
   options: MemoryDreamOptions,
   dependencies: MemoryDreamLaunchDependencies = {},
 ): Promise<string> {
   if (process.platform === "win32") throw new Error("Memory dream detached supervision currently requires a POSIX host");
-  if (options.handle.scope !== "project") throw new Error("Memory dream requires a project memory handle");
   if (!options.model.provider || !options.model.id) throw new Error("Memory dream requires an explicit provider and model");
+  const global = options.handle.scope === "global";
   // Validate identity/storage before creating private run artifacts; a lease is acquired by the worker.
-  if (!(await readMemorySchedule(options.handle)).due || await hasActiveMemoryDream(options.handle)) return "";
+  if (global) {
+    // The launch mark makes every frontend back off, so failed launches are not retried on each turn.
+    if (!await isGlobalMemoryDreamDue(options.handle) || !await markGlobalMemoryDreamLaunch(options.handle)) return "";
+  } else if (!(await readMemorySchedule(options.handle)).due || await hasActiveMemoryDream(options.handle)) return "";
   const runsDirectory = join(options.handle.directory, ".dream-runs");
   try { await mkdir(runsDirectory, { mode: 0o700 }); }
   catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
@@ -157,6 +163,7 @@ export async function runMemoryDream(
   const runDirectory = await mkdtemp(join(runsDirectory, "run-"));
   const config: MemoryDreamWorkerConfig = {
     ...options, runDirectory, deadline: Date.now() + (dependencies.timeoutMs ?? MEMORY_DREAM_TIMEOUT_MS),
+    workerCwd: global ? runDirectory : options.handle.identity,
   };
   const cliPath = dependencies.cliPath ?? await resolveMemoryDreamCli();
   const args = [cliPath, "--mode", "json", "--provider", options.model.provider, "--model", options.model.id,
@@ -165,14 +172,14 @@ export async function runMemoryDream(
     "-e", fileURLToPath(new URL("./memory-dream-worker.ts", import.meta.url))];
   if (options.thinkingLevel) args.push("--thinking", options.thinkingLevel);
   if (dependencies.cliArgs) args.push(...dependencies.cliArgs);
-  args.push("--", "Perform the assigned project memory dreaming pass. If the dream worker did not initialize a task, report the configuration failure and take no other action.");
+  args.push("--", "Perform the assigned memory dreaming pass. If the dream worker did not initialize a task, report the configuration failure and take no other action.");
   await writeFile(join(runDirectory, "status.json"), JSON.stringify({ state: "launching", deadline: config.deadline }) + "\n", { flag: "wx", mode: 0o600 });
   const log = await open(join(runDirectory, "supervisor.log"), constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY, 0o600);
   try {
     const child = (dependencies.spawn ?? spawn)(process.execPath, ["-e", MEMORY_DREAM_SUPERVISOR], {
-      cwd: options.handle.identity, detached: true, stdio: ["ignore", log.fd, log.fd],
+      cwd: config.workerCwd, detached: true, stdio: ["ignore", log.fd, log.fd],
       env: { ...process.env, PI_CODING_AGENT_DIR: options.agentDir, PI_MEMORY_DIR: join(options.handle.directory, ".."),
-        PI_MEMORY_DREAM_WORKER: "1", PI_MEMORY_DREAM_CONFIG: JSON.stringify(config),
+        PI_MEMORY_DREAM_WORKER: "1", PI_MEMORY_DREAM_SCOPE: options.handle.scope, PI_MEMORY_DREAM_CONFIG: JSON.stringify(config),
         PI_MEMORY_DREAM_LAUNCH: JSON.stringify({ args, killGraceMs: dependencies.killGraceMs ?? 5000 }) },
     });
     await new Promise<void>((resolve, reject) => { child.once("spawn", resolve); child.once("error", reject); });

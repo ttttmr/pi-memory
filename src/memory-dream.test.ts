@@ -7,9 +7,10 @@ import { fileURLToPath } from "node:url";
 import test, { type TestContext } from "node:test";
 import { createMemoryTestDirectory } from "../test/memory-fixtures.ts";
 import { runMemoryDream, MEMORY_DREAM_TIMEOUT_MS, type MemoryDreamOptions } from "./memory-dream.ts";
-import { buildMemoryDreamPrompt } from "./memory-dream-worker.ts";
+import { buildGlobalMemoryDreamPrompt, buildMemoryDreamPrompt } from "./memory-dream-worker.ts";
 import { claimMemoryDream, readMemorySchedule, recordMemoryTurn } from "./memory-schedule.ts";
-import { createMemoryStoreHandle, readMemoryNote } from "./memory-store.ts";
+import { createMemoryStoreHandle, readMemoryNote, writeMemoryNote } from "./memory-store.ts";
+import { recordMemoryNoteRead } from "./memory-access.ts";
 
 const packageRoot = fileURLToPath(new URL("../", import.meta.url));
 const cliPath = join(packageRoot, "node_modules/@earendil-works/pi-coding-agent/dist/cli.js");
@@ -73,7 +74,7 @@ function testEnvironment(ctx: TestContext, values: Record<string, string>) {
 test("dream prompt supplies session IDs, normal tools and an explicit 30-minute deadline without request/tool quotas", async (ctx) => {
   const h = await harness(ctx, 0);
   assert.equal(MEMORY_DREAM_TIMEOUT_MS, 1800000);
-  const prompt = buildMemoryDreamPrompt({ ...h.options, runDirectory: "/synthetic-run", deadline: 1800000 },
+  const prompt = buildMemoryDreamPrompt({ ...h.options, runDirectory: "/synthetic-run", deadline: 1800000, workerCwd: "/synthetic-project" },
     [{ sessionId: "synthetic-source-session", sessionFile: h.source }]);
   assert.match(prompt, /1970-01-01T00:30:00.000Z/);
   assert.match(prompt, /complete relevant sessions/);
@@ -85,6 +86,16 @@ test("dream prompt supplies session IDs, normal tools and an explicit 30-minute 
   assert.match(prompt, /never archive or rewrite global notes merely because this project did not use them/);
   assert.match(prompt, /need not recheck every note each pass/);
   assert.match(prompt, /project and global memory changes/);
+  assert.match(prompt, /low reads alone are not a reason to archive/);
+  const withAccess = buildMemoryDreamPrompt({ ...h.options, runDirectory: "/synthetic-run", deadline: 1800000, workerCwd: "/synthetic-project" },
+    [{ sessionId: "synthetic-source-session" }], "Project memory: SYNTHETIC_ACCESS_SUMMARY");
+  assert.match(withAccess, /Memory access statistics \(DATA, advisory hints, not evidence\):\nProject memory: SYNTHETIC_ACCESS_SUMMARY/);
+  const global = buildGlobalMemoryDreamPrompt({ ...h.options, runDirectory: "/synthetic-run", deadline: 1800000, workerCwd: "/synthetic-run" }, "SYNTHETIC_GLOBAL_ACCESS");
+  assert.match(global, /GLOBAL MEMORY MAINTENANCE/);
+  assert.match(global, /SYNTHETIC_GLOBAL_ACCESS/);
+  assert.match(global, /do not read Pi sessions, project memory or project files/);
+  assert.match(global, /Do not archive solely for low reads/);
+  assert.ok(!global.includes("synthetic-source-session"));
   assert.ok(!prompt.includes("SYNTHETIC_VERIFIED_FEEDBACK"), "The program supplies source locations, not evidence excerpts");
   assert.equal(await runMemoryDream(h.options), "");
 });
@@ -242,6 +253,38 @@ test("isolated CLI claim-lock failure starts no unassigned model request", { tim
   assert.equal(status.state, "failed");
   await assert.rejects(readFile(trace), { code: "ENOENT" }, "No provider request may run without a successful claim");
   assert.equal((await readMemorySchedule(h.options.handle)).pendingTurns, 50);
+});
+
+test("real isolated global pass runs outside any project, refuses project memory and acknowledges the global lease", { timeout: 25000 }, async (ctx) => {
+  const directory = await createMemoryTestDirectory(ctx);
+  const root = join(directory, "memory");
+  const handle = createMemoryStoreHandle(root, "global", "global");
+  for (const path of ["MEMORY.md", "tools/keep.md", "tools/dup.md"]) {
+    await writeMemoryNote(handle, { path, content: `# Synthetic ${path}\n`, expectedHash: null });
+  }
+  await recordMemoryNoteRead(handle, "tools/dup.md");
+  await recordMemoryNoteRead(handle, "tools/dup.md");
+  const trace = join(directory, "trace.jsonl");
+  testEnvironment(ctx, { PI_OFFLINE: "1", PI_SKIP_VERSION_CHECK: "1", PI_TELEMETRY: "0", JITI_FS_CACHE: "false",
+    PI_MEMORY_TEST_TRACE: trace });
+  const options: MemoryDreamOptions = { handle, model: { provider: "memory-global-dream-test", id: "scripted" },
+    agentDir: join(directory, "agent"), sessionRoots: [], thinkingLevel: "off" };
+  const receipt = await runMemoryDream(options, { cliPath, cliArgs: ["--offline", "--approve", "--no-extensions", "--no-mcp",
+    "--no-skills", "--no-prompt-templates", "--no-context-files", "--no-session", "-e", join(packageRoot, "test/memory-global-dream-provider.ts")] });
+  cleanupSupervisor(ctx, receipt);
+  assert.equal(await runMemoryDream(options), "", "The launch mark suppresses a second launch");
+  const run = await runDirectory(options);
+  const status = await waitForStatus(run, (state) => ["completed", "failed"].includes(String(state.state)));
+  assert.equal(status.state, "completed", JSON.stringify(status) + "\n" + await readFile(join(run, "supervisor.log"), "utf8"));
+  const calls = (await readFile(trace, "utf8")).trim().split("\n").map((line) => JSON.parse(line));
+  assert.ok(calls.every((call) => call.cwd === run), "The worker runs in its own run directory");
+  assert.equal(await readMemoryNote(handle, "tools/dup.md"), null);
+  assert.ok(await readMemoryNote(handle, "tools/keep.md"));
+  assert.deepEqual((await readdir(root)).filter((name) => !name.endsWith(".lock")), ["global"], "No project store was created");
+  const state = JSON.parse(await readFile(join(handle.directory, ".dream-state.json"), "utf8"));
+  assert.equal(state.claim, null);
+  assert.equal(typeof state.lastCompletedAt, "number");
+  assert.match(state.lastFingerprint, /^[a-f0-9]{64}$/);
 });
 
 test("an active project dream lease suppresses extra supervisors before creating run artifacts", async (ctx) => {

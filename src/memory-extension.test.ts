@@ -139,7 +139,7 @@ test("foreground memory guidance states purpose and leaves note selection and or
 
 test("autonomous Markdown writes, edits, links and archive work without human review", async (testCtx) => {
   const h = await createExtensionHarness(testCtx);
-  assert.deepEqual([...h.tools.keys()], ["memory_search", "memory_read", "memory_write"]);
+  assert.deepEqual([...h.tools.keys()], ["memory_search", "memory_read", "memory_write", "memory_history_search", "memory_history_read"]);
   const missing = resultValue(await h.call("memory_read", {}));
   assert.equal(missing.exists, false);
   assert.deepEqual(await readdir(h.directory), ["project"]);
@@ -415,6 +415,64 @@ test("dream worker retains memory tools and recall but never records or launches
   assert.equal(calls, 0);
   assert.equal((await readMemorySchedule(h.handle)).observedTurns, 0);
   assert.equal((await h.context([{ role: "user", content: "Synthetic maintenance", timestamp: 1 }])).messages.length, 2);
+});
+
+test("foreground reads record advisory access statistics; continuation pages and missing notes do not", async (testCtx) => {
+  const h = await createExtensionHarness(testCtx);
+  await h.call("memory_write", { path: "notes/a.md", content: memoryTestContent, expectedHash: null });
+  await h.call("memory_write", { scope: "global", path: "tools/g.md", content: memoryTestContent, expectedHash: null });
+  await h.call("memory_read", { path: "notes/a.md" });
+  await h.call("memory_read", { path: "notes/a.md", startCharacter: 10 });
+  await h.call("memory_read", { path: "notes/a.md", offset: 2 });
+  await h.call("memory_read", { path: "notes/missing.md" });
+  await h.call("memory_read", { scope: "global", path: "tools/g.md" });
+  const project = JSON.parse(await readFile(join(h.handle.directory, ".access.json"), "utf8"));
+  assert.deepEqual(project.notes.map((note: { path: string; reads: number }) => [note.path, note.reads]), [["notes/a.md", 1]]);
+  const global = JSON.parse(await readFile(join(h.root, "global", ".access.json"), "utf8"));
+  assert.deepEqual(global.notes.map((note: { path: string; reads: number }) => [note.path, note.reads]), [["tools/g.md", 1]]);
+  await h.call("memory_write", { path: "notes/b.md", content: memoryTestContent, expectedHash: null });
+  assert.deepEqual((await listMemoryNotes(h.handle)).map((note) => note.path), ["notes/a.md", "notes/b.md"]);
+});
+
+test("a due global store launches one throttled global pass from a trusted frontend", async (testCtx) => {
+  const launches: string[] = [];
+  const h = await createExtensionHarness(testCtx, async (options) => {
+    launches.push(options.handle.scope);
+    assert.equal(options.handle.directory, join(h.root, "global"));
+    assert.deepEqual(options.sessionRoots, [], "A global pass receives no project session roots");
+    return "Global worker started";
+  });
+  for (let index = 0; index < 3; index++) {
+    await h.call("memory_write", { scope: "global", path: `tools/n${index}.md`, content: memoryTestContent, expectedHash: null });
+  }
+  const launched = h.waitForDream();
+  await h.event("agent_settled");
+  await launched;
+  assert.deepEqual(launches, ["global"]);
+  await h.event("agent_settled");
+  assert.deepEqual(launches, ["global"], "Checks are throttled within a process");
+});
+
+test("a global dream worker cannot touch project memory and records no access", async (testCtx) => {
+  const saved = { worker: process.env.PI_MEMORY_DREAM_WORKER, scope: process.env.PI_MEMORY_DREAM_SCOPE };
+  process.env.PI_MEMORY_DREAM_WORKER = "1";
+  process.env.PI_MEMORY_DREAM_SCOPE = "global";
+  testCtx.after(() => {
+    if (saved.worker === undefined) delete process.env.PI_MEMORY_DREAM_WORKER; else process.env.PI_MEMORY_DREAM_WORKER = saved.worker;
+    if (saved.scope === undefined) delete process.env.PI_MEMORY_DREAM_SCOPE; else process.env.PI_MEMORY_DREAM_SCOPE = saved.scope;
+  });
+  const h = await createExtensionHarness(testCtx, async () => "must not launch");
+  await assert.rejects(h.call("memory_write", { path: "notes.md", content: "project", expectedHash: null }), /cannot access project memory/);
+  await h.call("memory_write", { scope: "global", path: "MEMORY.md", content: "# Global index\n- [G](tools/g.md)\n", expectedHash: null });
+  await h.call("memory_write", { scope: "global", path: "tools/g.md", content: memoryTestContent, expectedHash: null });
+  await h.call("memory_read", { scope: "global", path: "tools/g.md" });
+  await assert.rejects(readFile(join(h.root, "global", ".access.json")), { code: "ENOENT" });
+  const recalled = await h.context([{ role: "user", content: "Global pass", timestamp: 1 }]);
+  assert.equal(recalled.messages.length, 2);
+  const firstText = JSON.stringify(recalled.messages[0]);
+  assert.match(firstText, /<global-memory-index/);
+  assert.doesNotMatch(firstText, /<project-memory-index/);
+  assert.deepEqual(h.notices, []);
 });
 
 test("agent_settled lock contention queues both turns and automatically dreams when the lock is released", async (testCtx) => {

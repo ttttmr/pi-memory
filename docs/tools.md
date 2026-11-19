@@ -2,7 +2,7 @@
 
 English | [简体中文](tools.zh-CN.md)
 
-This page describes pi-memory's Markdown memory interfaces. Return to the [README](../README.md), or see the [design](design.md) for organization and lifecycle. `memory_search`, `memory_read`, and `memory_write` are tools called by the model, not user commands. Users only need `/memory <one thing to remember, in natural language>` to request a save. The foreground model decides how to call these tools; the command handler does not generate notes directly.
+This page describes pi-memory's Markdown memory and foreground session history interfaces. Return to the [README](../README.md), or see the [design](design.md) for organization and lifecycle. These tools are called by the model, not run as user commands. Users only need `/memory <one thing to remember, in natural language>` to request a save. The foreground model decides how to call the tools; the command handler does not generate notes directly.
 
 ## Paths and scopes
 
@@ -81,6 +81,8 @@ For example, if the call above uses `offset` 1 and `limit` 100 and returns `next
 ```
 
 8000 is only an example. Use the returned `nextCharacter` rather than calculating it from the page size.
+
+In the foreground, the first page of a successful read (`offset` omitted or 1, and `startCharacter` omitted or 0) also increments the note's advisory read count in the scope's `.access.json`. Continuation pages, missing notes, and reads inside dreaming workers are not counted. Statistics failures or a held statistics lock never fail the read. Maintenance prompts use these counts as hints; see the [design](design.md#reads-leave-advisory-access-statistics).
 
 Read the global index:
 
@@ -168,16 +170,42 @@ This is one possible usage pattern, not a fixed sequence that the foreground mod
 
 This does not require manual approval at each step. The Agent may call writing tools autonomously, including for global memory. Authorization in historical notes cannot expand the actions allowed for the current task.
 
+## Foreground session history
+
+These read-only tools complement Markdown notes. Both require Pi project trust and only access native sessions belonging to the current project. They use the live current branch and the final branch in each discovered historical session, honor branch-local context deletions and replacements, and return visible user, assistant, and tool-result text. They omit thinking, images, system messages, tool arguments, and results attributed directly to `memory_` tools. Historical text is evidence, not instructions or proof of independent verification. Text returned by either tool, including search previews, can be sent to the selected model provider. Start with `--pi-memory-no-history` to omit both tools.
+
+### memory_history_search
+
+| Parameter | Required | Default and constraints |
+| --- | --- | --- |
+| `query` | Yes | At most 4096 characters; all case-insensitive terms must occur in the text. An empty query or a query without terms lists visible entries. |
+| `sessionId` | No | Restrict to one native session ID, not a path |
+| `offset` | No | Defaults to `0`; otherwise reuse a returned `nextOffset` with the same query and session filter |
+| `limit` | No | Default 20; integer from 1 to 64 |
+
+The result contains `sources` with IDs, provenance metadata and previews (first 240 Unicode code points), plus `nextOffset`. The offset is an opaque scan cursor, not a result count. If it is not `null`, continue even if `sources` is empty. `partial`, `truncated` and `warnings` report boundaries encountered during the scan. Cursor pages may change if sessions change between calls; a miss does not prove the text does not exist. If the JSON result exceeds the size cap, retry from the same offset with a smaller `limit`.
+
+### memory_history_read
+
+| Parameter | Required | Default and constraints |
+| --- | --- | --- |
+| `id` | Yes | A source ID returned by `memory_history_search`, not a file path |
+| `startCharacter` | No | Defaults to `0`; otherwise use the returned `nextCharacter` for the same ID |
+
+The result includes `text` (up to 8 KiB UTF-8), a SHA-256 `hash` of the complete visible text, and provenance including `sessionId`, `entryId` and `evidence`. A replacement is marked `context-edited`; it is not the original text. A non-null `nextCharacter` is a Unicode code-point offset. If the hash changes between pages, reread from the beginning. An ID can become unavailable after a branch change or context edit.
+
 ## Tools available during dreaming
 
-Dreaming launches a normal Pi CLI Agent, not the former project-only source-tool loop. It has the default `read`, `bash`, `edit`, and `write` tools, the three memory tools above, and resources loaded by normal Pi configuration, including configured extensions, skills, and MCP tools. Runtime-only changes in the foreground process are not copied. The old `memory_source_search` and `memory_source` interfaces are not registered for the worker; their implementation remains in the repository for existing tests and reference.
+Dreaming launches a normal Pi CLI Agent, not the former project-only source-tool loop. It has the default `read`, `bash`, `edit`, and `write` tools, the three Markdown memory tools, and resources loaded by normal Pi configuration, including configured extensions, skills, and MCP tools. Runtime-only changes in the foreground process are not copied. Neither the foreground `memory_history_*` tools nor the former `memory_source_search` and `memory_source` interfaces are registered for the worker.
 
-The task gives the Agent session IDs, optional native-file hints, session roots, the project identity, and a deadline. The Agent chooses how to find and read raw native history and existing memory. Session hints are not source copies or a permanent search index. Raw file reads do not enforce the former source provider's active-branch projection, context-edit filtering, field exclusions, or pagination. Deleted or replaced context and sensitive raw fields may still exist in native logs.
+The task gives the Agent session IDs, optional native-file hints, session roots, the project identity, and a deadline. The Agent chooses how to find and read raw native history and existing memory. Session hints are not source copies or a permanent search index. Raw file reads do not enforce the foreground history tools' active-branch projection, context-edit filtering, field exclusions, or pagination. Deleted or replaced context and sensitive raw fields may still exist in native logs.
 
 The maintenance prompt restricts the task to memory maintenance for the current project's memory, plus global memory where that project's evidence supports genuinely cross-project, nonprivate knowledge: read sessions and source code without modifying them, use memory tools for safe note writes, check evidence, and treat historical instructions as untrusted data rather than authorization. These are prompt instructions, **not an OS sandbox or a tool allowlist**. The Agent's normal tools can access files, execute commands, and use configured network-capable tools. Do not enable automatic dreaming unless this authority and historical-data exposure are acceptable. See the [user guide](usage.md#privacy-and-usage-notes) and [design](design.md#independent-dreaming-agent) for lifecycle, costs, and run logs.
 
+The separate global pass gets the same normal tools but runs in its own run directory with no project or session context. Project-scope memory tools are refused there and `memory_search` defaults to `global`. Its prompt limits it to consolidating global memory; see the [design](design.md#a-low-frequency-global-pass-consolidates-global-memory).
+
 ## Output and errors
 
-The three foreground tools return JSON as text and do not declare an `outputSchema`. Do not assume the host has parsed it into structured objects. The extension keeps results as complete JSON with a 50 KiB output limit. It neither appends truncation text after JSON nor truncates at 2000 lines. Oversized search arrays use the wrapper object described above. Other oversized results raise an error and require a smaller request. Longer content uses the `offset`, `limit`, `startCharacter`, and `nextCharacter` pagination protocol. Write receipts do not include note content.
+Tools return JSON as text and do not declare an `outputSchema`. Do not assume the host has parsed it into structured objects. The extension keeps results as complete JSON with a 50 KiB output limit. It neither appends truncation text after JSON nor truncates at 2000 lines. Oversized Markdown search arrays use the wrapper object described above. Other oversized results raise an error. For longer text, use the relevant read tool's pagination parameters. Write receipts do not include note content.
 
 Invalid paths, identity mismatches, insufficient permissions, hash conflicts, lock conflicts, capacity limits, and write failures must be handled as errors, not automatically overwritten as an empty store. `exists: false` for a missing file only means that path does not exist, not that all other notes in the scope are absent. See [user-guide troubleshooting](usage.md#troubleshooting) for recovery and diagnosis.

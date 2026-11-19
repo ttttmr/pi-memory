@@ -27,6 +27,8 @@ const MAX_HISTORY_FILES = 1000;
 const IDENTITY_FILE = ".identity.json";
 const SCHEDULE_FILE = ".dream-state.json";
 const MAX_SCHEDULE_BYTES = 1024 * 1024;
+const ACCESS_FILE = ".access.json";
+const MAX_ACCESS_BYTES = 1024 * 1024;
 
 /** A memory document hash is SHA-256 of its exact UTF-8 content, not its path. */
 export interface MemoryDocument { path: string; content: string; hash: string }
@@ -107,6 +109,47 @@ export async function mutateMemoryScheduleData<T>(
     }
     return result;
   }, signal);
+}
+
+/** Read advisory note-access statistics without creating storage; null means none were recorded. */
+export async function readMemoryAccessData(handle: MemoryStoreHandle): Promise<unknown | null> {
+  if (!await validateMemoryIdentity(handle)) return null;
+  const content = await readMemoryFile(join(handle.directory, ACCESS_FILE), MAX_ACCESS_BYTES);
+  return content === null ? null : JSON.parse(content) as unknown;
+}
+
+/**
+ * Mutate advisory access statistics in an existing store. A separate lock keeps statistics from
+ * blocking note or schedule writes; a missing store returns undefined and is never created.
+ */
+export async function mutateMemoryAccessData<T>(
+  handle: MemoryStoreHandle,
+  mutation: (data: unknown | null) => { data: unknown; result: T },
+  signal?: AbortSignal,
+): Promise<T | undefined> {
+  signal?.throwIfAborted();
+  if (!await validateMemoryIdentity(handle)) return undefined;
+  const lockPath = `${handle.directory}.access.lock`;
+  try { await mkdir(lockPath, { mode: 0o700 }); }
+  catch (error) {
+    if (hasMemoryErrorCode(error, "EEXIST")) throw new MemoryStoreLockedError(lockPath);
+    throw error;
+  }
+  try {
+    const { data, result } = mutation(await readMemoryAccessData(handle));
+    const content = JSON.stringify(data);
+    if (content === undefined || data === null) throw new Error("Memory access data must serialize to non-null JSON");
+    if (Buffer.byteLength(content + "\n") > MAX_ACCESS_BYTES) throw new Error("Memory access statistics exceed 1 MiB");
+    await atomicMemoryWrite(join(handle.directory, ACCESS_FILE), content + "\n", signal);
+    return result;
+  } finally {
+    await rmdir(lockPath);
+  }
+}
+
+/** Fingerprint active Markdown paths and content hashes, e.g. to detect changes between maintenance passes. */
+export function memoryNotesFingerprint(documents: MemoryDocument[]): string {
+  return memoryContentHash(documents.map((document) => `${document.path}\0${document.hash}`).join("\n"));
 }
 
 /** Atomic Markdown writes use create-only null or an exact hash; every replaced version is retained. */

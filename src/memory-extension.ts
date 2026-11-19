@@ -10,6 +10,10 @@ import {
   resolveMemoryProject, writeMemoryNote, type MemoryStoreHandle,
 } from "./memory-store.ts";
 import { buildMemoryRecall, searchMemoryNotes } from "./memory-search.ts";
+import { recordMemoryNoteRead } from "./memory-access.ts";
+import { isGlobalMemoryDreamDue } from "./memory-global-schedule.ts";
+import { registerMemoryHistoryTools } from "./memory-history.ts";
+import { memoryToolResult } from "./memory-tool-result.ts";
 import type { MemoryDreamNotification } from "./memory-dream-notifications.ts";
 import { runMemoryDream, type MemoryDreamOptions } from "./memory-dream.ts";
 import {
@@ -21,6 +25,8 @@ interface MemoryObservationRuntime {
   queue?: MemoryObservationQueue;
   callbacks: MemoryObservationQueueOptions;
   launch?: Promise<void>;
+  globalLaunch?: Promise<void>;
+  nextGlobalDreamCheckAt?: number;
   statusControllers?: Set<AbortController>;
   pendingNotifications?: MemoryDreamNotification[];
   notify?: (notification: MemoryDreamNotification) => void;
@@ -34,6 +40,7 @@ interface MemoryToolAccess {
 }
 
 const RECALL_MESSAGE_TYPE = "pi-memory-recall";
+const GLOBAL_DREAM_CHECK_INTERVAL_MS = 10 * 60 * 1000;
 const scopeSchema = Type.Optional(Type.Enum(["project", "global"]));
 const searchSchema = Type.Object({
   query: Type.Optional(Type.String({ maxLength: 1000 })),
@@ -56,6 +63,7 @@ export default function piMemoryExtension(
   let recallEnabled = true;
   let dreamEnabled = true;
   const isDreamWorker = process.env.PI_MEMORY_DREAM_WORKER === "1";
+  const isGlobalDreamWorker = isDreamWorker && process.env.PI_MEMORY_DREAM_SCOPE === "global";
   const observedUserEntries = new Set<string>();
   let lastRecallError = "";
   let observationContext: ExtensionContext | undefined;
@@ -63,6 +71,7 @@ export default function piMemoryExtension(
   let sessionGeneration = 0;
 
   const handleFor = async (ctx: ExtensionContext, scope: MemoryScope) => {
+    if (scope === "project" && isGlobalDreamWorker) throw new Error("Global memory dreaming cannot access project memory");
     if (scope === "project" && !ctx.isProjectTrusted()) throw new Error("Memory project access requires Pi project trust");
     const root = process.env.PI_MEMORY_DIR || join(getAgentDir(), "pi-memory");
     const project = scope === "project" ? await resolveMemoryProject(ctx.cwd) : "global";
@@ -73,7 +82,8 @@ export default function piMemoryExtension(
   });
   const searchNotes = async (params: Static<typeof searchSchema>, signal: AbortSignal | undefined, access: MemoryToolAccess) => {
     signal?.throwIfAborted();
-    const scopes: MemoryScope[] = !params.scope || params.scope === "all" ? ["project", "global"] : [params.scope];
+    const scopes: MemoryScope[] = !params.scope || params.scope === "all" ?
+      (isGlobalDreamWorker ? ["global"] : ["project", "global"]) : [params.scope];
     const notes = (await Promise.all(scopes.map(async (scope) =>
       (await listMemoryNotes(await access.handleFor(scope))).map((document) => ({ scope, document }))))).flat();
     const hits = searchMemoryNotes(notes, params.query, params.limit);
@@ -81,8 +91,14 @@ export default function piMemoryExtension(
   };
   const readNote = async (params: Static<typeof readSchema>, signal: AbortSignal | undefined, access: MemoryToolAccess) => {
     signal?.throwIfAborted();
-    const document = await readMemoryNote(await access.handleFor(params.scope ?? "project"), params.path ?? "MEMORY.md");
+    const handle = await access.handleFor(params.scope ?? "project");
+    const document = await readMemoryNote(handle, params.path ?? "MEMORY.md");
     if (!document) return memoryToolResult({ path: params.path ?? "MEMORY.md", exists: false, hash: null });
+    // Count the first page of a foreground read as one access; continuation pages and dreaming reads do not count.
+    // Statistics are advisory, so their failures never fail the read.
+    if (!isDreamWorker && (params.offset ?? 1) === 1 && !params.startCharacter) {
+      await recordMemoryNoteRead(handle, document.path).catch(() => false);
+    }
     const lines = document.content.split("\n");
     const offset = params.offset ?? 1;
     const limit = params.limit ?? 500;
@@ -147,48 +163,51 @@ export default function piMemoryExtension(
   pi.registerTool(readTool);
   pi.registerTool(writeTool);
 
+  // Project and global passes use separate launch slots; observation never owns or waits for a worker's lifecycle.
+  function startDetachedDream(options: MemoryDreamOptions, slot: "launch" | "globalLaunch"): void {
+    const controller = new AbortController();
+    (observationRuntime.statusControllers ??= new Set()).add(controller);
+    let launchDelivered = false;
+    const earlyNotifications: MemoryDreamNotification[] = [];
+    const deliverStatus = (notification: MemoryDreamNotification) => {
+      if (!controller.signal.aborted) observationRuntime.notify?.(notification);
+    };
+    const launch = dreamRunner(options, {
+      statusSignal: controller.signal,
+      onStatus(notification) {
+        if (notification.state !== "running") observationRuntime.statusControllers?.delete(controller);
+        // Deliver the launch receipt first, even when the worker finishes immediately.
+        if (launchDelivered) deliverStatus(notification);
+        else earlyNotifications.push(notification);
+      },
+    }).then((receipt) => {
+      if (!receipt) {
+        controller.abort();
+        observationRuntime.statusControllers?.delete(controller);
+        return;
+      }
+      if (observationContext?.hasUI) observationContext.ui.notify(receipt, "info");
+      else console.error(receipt); // Keep JSON/RPC stdout reserved for the host protocol.
+      launchDelivered = true;
+      for (const notification of earlyNotifications) deliverStatus(notification);
+    }, (error: unknown) => {
+      controller.abort();
+      observationRuntime.statusControllers?.delete(controller);
+      const message = `Memory dreaming launch failed: ${error instanceof Error ? error.message : String(error)}`;
+      if (observationContext) showMemoryCommand(observationContext, message, "warning");
+      else console.error(message);
+    });
+    observationRuntime[slot] = launch;
+    void launch.finally(() => {
+      if (observationRuntime[slot] === launch) observationRuntime[slot] = undefined;
+    });
+  }
   const observationCallbacks: MemoryObservationQueueOptions = {
     onRecorded(handle, turn, snapshot) {
       const current = latestObservation;
       if (!current || current.handle.directory !== handle.directory || current.sessionId !== turn.sessionId ||
           current.entryId !== turn.entryId || !dreamEnabled || isDreamWorker || !snapshot.due || observationRuntime.launch) return;
-      // Observation never owns or waits for the detached worker's lifecycle.
-      const controller = new AbortController();
-      (observationRuntime.statusControllers ??= new Set()).add(controller);
-      let launchDelivered = false;
-      const earlyNotifications: MemoryDreamNotification[] = [];
-      const deliverStatus = (notification: MemoryDreamNotification) => {
-        if (!controller.signal.aborted) observationRuntime.notify?.(notification);
-      };
-      const launch = dreamRunner(current.launch, {
-        statusSignal: controller.signal,
-        onStatus(notification) {
-          if (notification.state !== "running") observationRuntime.statusControllers?.delete(controller);
-          // Deliver the launch receipt first, even when the worker finishes immediately.
-          if (launchDelivered) deliverStatus(notification);
-          else earlyNotifications.push(notification);
-        },
-      }).then((receipt) => {
-        if (!receipt) {
-          controller.abort();
-          observationRuntime.statusControllers?.delete(controller);
-          return;
-        }
-        if (observationContext?.hasUI) observationContext.ui.notify(receipt, "info");
-        else console.error(receipt); // Keep JSON/RPC stdout reserved for the host protocol.
-        launchDelivered = true;
-        for (const notification of earlyNotifications) deliverStatus(notification);
-      }, (error: unknown) => {
-        controller.abort();
-        observationRuntime.statusControllers?.delete(controller);
-        const message = `Memory dreaming launch failed: ${error instanceof Error ? error.message : String(error)}`;
-        if (observationContext) showMemoryCommand(observationContext, message, "warning");
-        else console.error(message);
-      });
-      observationRuntime.launch = launch;
-      void launch.finally(() => {
-        if (observationRuntime.launch === launch) observationRuntime.launch = undefined;
-      });
+      startDetachedDream(current.launch, "launch");
     },
     onError(_handle, error) {
       const message = `Memory dreaming schedule unavailable: ${error instanceof Error ? error.message : String(error)}. User-message observations remain queued in this process.`;
@@ -217,7 +236,10 @@ export default function piMemoryExtension(
 
   pi.registerFlag("pi-memory-no-recall", { description: "Disable memory index injection (tools remain available)", type: "boolean", default: false });
   pi.registerFlag("pi-memory-no-dream", { description: "Disable automatic extra model calls for memory dreaming", type: "boolean", default: false });
+  pi.registerFlag("pi-memory-no-history", { description: "Disable Pi session history search and read tools", type: "boolean", default: false });
   pi.on("session_start", async (_event, ctx) => {
+    // CLI flag values are available after extension loading, before the first request.
+    if (!isDreamWorker && !pi.getFlag("pi-memory-no-history")) registerMemoryHistoryTools(pi);
     observationContext = ctx;
     for (const notification of observationRuntime.pendingNotifications?.splice(0) ?? []) observationRuntime.notify?.(notification);
     resetObservationContext();
@@ -237,6 +259,7 @@ export default function piMemoryExtension(
     resetObservationContext();
     // Do not exit between preparing launch files and spawning the detached process.
     await observationRuntime.launch;
+    await observationRuntime.globalLaunch;
     if (event.reason && event.reason !== "quit") {
       // Replacement reuses pending observations, never the retired host context.
       if (!isDreamWorker) await observations.flush();
@@ -282,7 +305,27 @@ export default function piMemoryExtension(
     } catch (error) {
       showMemoryCommand(ctx, `Memory dreaming schedule unavailable: ${error instanceof Error ? error.message : String(error)}`, "warning");
     }
+    await maybeStartGlobalDream(ctx, generation);
   });
+  // A low-frequency global pass consolidates and prunes global memory, which project passes may only add to or correct.
+  // Checks are throttled per process; the shared global state applies cross-process backoff and the lease.
+  const maybeStartGlobalDream = async (ctx: ExtensionContext, generation: number) => {
+    const now = Date.now();
+    if (!dreamEnabled || !ctx.model || observationRuntime.globalLaunch ||
+        generation !== sessionGeneration || observationRuntime.callbacks !== observationCallbacks ||
+        (observationRuntime.nextGlobalDreamCheckAt ?? 0) > now) return;
+    try {
+      const handle = await handleFor(ctx, "global");
+      const due = await isGlobalMemoryDreamDue(handle);
+      if (generation !== sessionGeneration || observationRuntime.callbacks !== observationCallbacks) return;
+      observationRuntime.nextGlobalDreamCheckAt = Date.now() + GLOBAL_DREAM_CHECK_INTERVAL_MS;
+      if (!due) return;
+      startDetachedDream({ handle, agentDir: getAgentDir(), model: { provider: ctx.model.provider, id: ctx.model.id },
+        thinkingLevel: pi.getThinkingLevel(), sessionRoots: [] }, "globalLaunch");
+    } catch (error) {
+      showMemoryCommand(ctx, `Global memory maintenance schedule unavailable: ${error instanceof Error ? error.message : String(error)}`, "warning");
+    }
+  };
 
   pi.on("context", async (event, ctx) => {
     const messages = event.messages.filter((message) => message.role !== "custom" || message.customType !== RECALL_MESSAGE_TYPE);
@@ -290,7 +333,8 @@ export default function piMemoryExtension(
     const userIndex = messages.findLastIndex((message) => message.role === "user");
     if (userIndex < 0) return { messages };
     try {
-      const indexes = await Promise.all((["project", "global"] as const).map(async (scope) => ({
+      const scopes: readonly MemoryScope[] = isGlobalDreamWorker ? ["global"] : ["project", "global"];
+      const indexes = await Promise.all(scopes.map(async (scope) => ({
         scope, document: await readMemoryNote(await handleFor(ctx, scope), "MEMORY.md"),
       })));
       const content = buildMemoryRecall(indexes);
@@ -316,20 +360,6 @@ export default function piMemoryExtension(
       });
     },
   });
-}
-
-function memoryToolResult(value: unknown) {
-  const maxBytes = 50 * 1024;
-  let text = JSON.stringify(value, null, 2);
-  if (Buffer.byteLength(text) > maxBytes) {
-    if (!Array.isArray(value)) throw new Error("Memory tool result exceeds 50 KiB; request a smaller page");
-    const results = [...value];
-    do {
-      results.pop();
-      text = JSON.stringify({ results, outputTruncated: true, hint: "Request fewer results or a narrower query." }, null, 2);
-    } while (Buffer.byteLength(text) > maxBytes && results.length);
-  }
-  return { content: [{ type: "text" as const, text }], details: {} };
 }
 
 function showMemoryCommand(ctx: ExtensionContext, text: string, type: "info" | "error" | "warning" = "info"): void {

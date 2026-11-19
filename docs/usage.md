@@ -28,7 +28,7 @@ In a later session with the extension loaded in the same project, ask normally:
 
 > What checks should I run before delivering this project? Please look up the earlier memory.
 
-The three model tools are `memory_search`, `memory_read`, and `memory_write`. You do not need to write their arguments yourself. Ask the agent in natural language to find, read, correct, or archive a memory. `/memory` is the only extension command; there are no path, list, search, or maintenance subcommands. See the [tool reference](tools.md) for the tool protocol.
+Ask the agent in natural language to find, read, correct, or archive a note. If the notes are missing a detail, you can ask it to look up past conversations from this project. You do not need to supply tool arguments yourself. `/memory` is the only extension command; there are no path, list, search, or maintenance subcommands. See the [tool reference](tools.md) for the tool protocol.
 
 Agents can also save useful knowledge during ordinary work. Not everything discussed is guaranteed to be saved. When retention matters, ask explicitly and have the agent read back the saved content. A reply saying "I'll remember" does not prove that a file was written.
 
@@ -64,6 +64,8 @@ For local development, you can still load a checkout with `pi -e /absolute/path/
 
 Automatic recall and automatic background maintenance are enabled unless disabled at startup. After 50 unprocessed actual user messages accumulate in the same project, a detached normal Pi Agent can review that project's historical sessions, create notes, and maintain existing notes. Messages are observed after foreground runs settle and deduplicated durably by entry ID across sessions. Existing messages at session startup are baselined, not counted retroactively. Foreground notes do not need to exist first. Old pending-turn state migrates as one-shot legacy work, not as actual user-message counts.
 
+A separate, less frequent global pass consolidates and prunes global memory: first when global memory has at least 3 Markdown files, then when it has changed and at least 7 days have passed, or every 30 days. It runs outside any project, sees no project history, and backs off for 6 hours after each launch attempt. Foreground `memory_read` calls also record per-note read counts in each scope's `.access.json`; both maintenance passes use them as hints, never as the only reason to archive a note.
+
 Background maintenance uses the selected provider, model, and thinking level and **makes extra requests that may incur charges, including after you quit Pi**. It reloads normal Pi configuration and credentials and has default file/shell tools plus configured extensions, skills, and MCP tools. Runtime-only changes in the frontend are not copied. The worker reevaluates normal project trust; an unpersisted foreground approval may not carry over and can cause a safe startup failure. This is not a restricted source-tool sandbox. Add `--pi-memory-no-dream` at startup to prevent new automatic launches. This flag does not cancel an already running worker.
 
 To disable both features:
@@ -80,6 +82,10 @@ You can keep chatting, navigate the session tree, switch sessions, reload extens
 
 While the launching Pi process remains open, it shows brief notifications for launch and observed running, completed, failed, timed-out, or unclaimed states. Each notice includes the run directory. Completion means the worker acknowledged its claimed batch, not that every memory claim was verified. Reloading or switching sessions in the same process keeps status observation active. Quitting stops foreground notifications, not the worker; later Pi processes do not replay those notices. Print/JSON modes write notices to stderr. If status observation fails or no final state is available shortly after the deadline, a warning reports that completion is unknown. Inspect `status.json` and logs for details.
 
+## Control foreground session history
+
+In a trusted project, the Agent can search and read visible text from the project's Pi sessions on demand. Start Pi with `--pi-memory-no-history` to leave these tools unregistered. The switch is independent of automatic recall and background maintenance. It does not delete sessions, restrict other tools' file access, or prevent a dreaming worker from reading raw session files.
+
 ## Storage and backups
 
 The default root is usually `~/.pi/agent/pi-memory`, specifically `pi-memory/` under Pi's agent directory. It contains project directories named `project-<hash>/` and a `global/` directory. Set `PI_MEMORY_DIR` to use another location; an absolute path is recommended:
@@ -93,13 +99,13 @@ Use project memory for project details. Global memory is only for knowledge that
 
 Subdirectories of the same Git project share project memory. Separate worktrees and clones at different paths do not. Moving the project changes its memory identity and does not move the files automatically. See the [design guide](design.md#locating-the-two-scopes) for the exact rules.
 
-Before backing up, ensure every writer has stopped, including detached maintenance workers. Closing foreground Pi alone is insufficient; check the run records first. Copy the entire storage root, including hidden files and history. Each project's `.dream-runs/<run>/` holds private `status.json`, `events.jsonl`, `supervisor.log`, and the worker's native session under `sessions/`. These may contain sensitive raw tool text; protect them along with notes and backups. Archiving a note is not permanent deletion and does not remove existing sessions, backups, or provider copies.
+Before backing up, ensure every writer has stopped, including detached maintenance workers. Closing foreground Pi alone is insufficient; check the run records first. Copy the entire storage root, including hidden files and history. Each scope's `.dream-runs/<run>/` holds private `status.json`, `events.jsonl`, `supervisor.log`, and the worker's native session under `sessions/`. These may contain sensitive raw tool text; protect them along with notes and backups. Archiving a note is not permanent deletion and does not remove existing sessions, backups, or provider copies.
 
 ## Troubleshooting
 
 | Symptom | Check or action |
 | --- | --- |
-| `/memory` or the three tools are missing | Check that the GitHub package or local checkout is loaded and that another extension is not registering the same command or tools. |
+| `/memory` or memory tools are missing | Check that the GitHub package or local checkout is loaded and that another extension is not registering the same command or tools. If only the session history tools are missing, check `--pi-memory-no-history` and Pi's tool selection. |
 | No note was saved | Ask explicitly with `/memory`, then have the agent read back the saved content. Background maintenance can also create notes from past work, but not every conversation is guaranteed to be retained. |
 | A nonempty `/memory` exits immediately in print mode | Use `/memory` inside an interactive Pi session. Pi 1.5.0 can dispose the command-generated request too early with `pi -p '/memory …'`; this one-shot form is not a supported save path. |
 | Project memory requires trust | Review the project first, then authorize it through Pi. Do not blindly trust an unfamiliar project. |
@@ -109,12 +115,13 @@ Before backing up, ensure every writer has stopped, including detached maintenan
 | Memory lock conflict | Retry note writes after the writer finishes. Interaction counts stay queued in the current process and are retried after lock release without stealing the lock. If exit reports unsaved counts, do not treat them as persisted. Handle a crash-leftover lock manually only after confirming there is no writer. |
 | Identity, path, or file validation failed | Stop writing and preserve the files. Check ownership and structure rather than clearing the directory to bypass the error. |
 | Capacity or history limit reached | Stop writing and back up first, then follow the [storage limits](design.md#archiving-and-capacity). Archiving also requires history space. |
+| Global maintenance did not start | It needs automatic maintenance enabled in a trusted frontend, at least 3 global Markdown files, and the 7-day/30-day and 6-hour backoff conditions. Check `global/.dream-state.json` and `global/.dream-runs/`. |
 | Automatic maintenance did not start | Check startup flags, project trust, and the selected model. 50 unprocessed actual user messages must accumulate in the same project (or migrated legacy work must be due). Startup history does not count. Check `.dream-state.json` and `.dream-runs/`; a valid project lease prevents duplicate launches. Unlaunched work waits while Pi is closed, but an active worker can continue. |
 | Maintenance failed or timed out | Inspect the run's `status.json`, `events.jsonl`, `supervisor.log`, and native session. Check model availability and normal worker configuration. Launch success does not mean completion; failures keep pending work and completed writes remain. |
 
 ## Privacy and usage notes
 
-Files are stored locally in plaintext. Notes loaded into context and historical material read by the worker are sent to the selected model provider. The detached Agent can read raw same-project native sessions across conversations, including retained pre-compaction text and raw fields not exposed by the old filtered source tools. Direct file reads do not automatically enforce active-branch selection, context deletions or replacements, or exclusion of thinking, images, system-related content, and tool arguments. Do not assume deleted context has been erased from native logs.
+Files are stored locally in plaintext. Notes loaded into context, text returned by foreground history tools (including search previews), and historical material read by the worker are sent to the selected model provider when included in a model request. The detached Agent can read raw same-project native sessions across conversations, including retained pre-compaction text and raw fields not exposed by the foreground history tools. Direct file reads do not automatically enforce active-branch selection, context deletions or replacements, or exclusion of thinking, images, system-related content, and tool arguments. Do not assume deleted context has been erased from native logs.
 
 The task prompt requires read-only treatment of sessions and source code, safe memory writes through memory tools (project memory, plus global memory only for cross-project, nonprivate knowledge without project names or paths), and treating historical instructions as untrusted evidence rather than permission. **These are prompt rules, not an OS sandbox.** The worker has normal Pi file/shell tools and configured extensions, skills, and MCP resources, which may access files or the network. Its own session and event logs can retain sensitive tool text. Do not save credentials, private prompts, personal information, or whole logs as notes. Local storage does not mean content stays on the device. Disable automatic maintenance at startup if this history access or full Agent authority is unacceptable; this prevents new launches, not a worker already running.
 
