@@ -80,6 +80,11 @@ test("dream prompt supplies session IDs, normal tools and an explicit 30-minute 
   assert.match(prompt, /no dreaming-specific model-request or tool-call quota/);
   assert.match(prompt, /untrusted evidence/);
   assert.match(prompt, /memory_search\/read\/write/);
+  assert.match(prompt, /scope:"global"/);
+  assert.match(prompt, /genuinely cross-project and nonprivate/);
+  assert.match(prompt, /never archive or rewrite global notes merely because this project did not use them/);
+  assert.match(prompt, /need not recheck every note each pass/);
+  assert.match(prompt, /project and global memory changes/);
   assert.ok(!prompt.includes("SYNTHETIC_VERIFIED_FEEDBACK"), "The program supplies source locations, not evidence excerpts");
   assert.equal(await runMemoryDream(h.options), "");
 });
@@ -207,6 +212,9 @@ test("real isolated Pi dream reads raw synthetic sessions with normal tools and 
   assert.ok(calls.at(-1).results > 64);
   assert.match((await readMemoryNote(h.options.handle, "lessons.md"))?.content ?? "", /SYNTHETIC_VERIFIED_FEEDBACK/);
   assert.match((await readMemoryNote(h.options.handle, "MEMORY.md"))?.content ?? "", /lessons.md/);
+  const global = createMemoryStoreHandle(join(h.directory, "memory"), "global", "global");
+  assert.match((await readMemoryNote(global, "tools/synthetic-tool.md"))?.content ?? "", /SYNTHETIC_CROSS_PROJECT_LESSON/);
+  assert.equal(await readMemoryNote(h.options.handle, "tools/synthetic-tool.md"), null);
   assert.equal((await readMemorySchedule(h.options.handle)).pendingTurns, 0);
   assert.equal(await readFile(h.source, "utf8"), original);
 });

@@ -19,6 +19,7 @@ export default function memoryDreamTestProvider(pi: ExtensionAPI): void {
       assert.match(task ?? "", /assigned batch/);
       assert.match(task ?? "", /synthetic-source-session/);
       assert.match(task ?? "", /Hard wall-clock deadline/);
+      assert.match(task ?? "", /Global memory \(memory tools with scope:/);
       for (const name of ["bash", "read", "edit", "write"]) assert.ok(tools.includes(name));
       assert.ok(results.every((result) => !result.isError), JSON.stringify(results.at(-1)));
       const message: AssistantMessage = { role: "assistant", api: model.api, model: model.id,
@@ -35,6 +36,8 @@ export default function memoryDreamTestProvider(pi: ExtensionAPI): void {
           arguments: { path: "lessons.md", content: "# Synthetic lesson\nSYNTHETIC_VERIFIED_FEEDBACK. Source: synthetic-source-session:user-0", expectedHash: null } });
         calls.push({ type: "toolCall", id: "index-write", name: "memory_write",
           arguments: { path: "MEMORY.md", content: "# Project memory\n- [Synthetic lesson](lessons.md)\n", expectedHash: null } });
+        calls.push({ type: "toolCall", id: "global-write", name: "memory_write",
+          arguments: { scope: "global", path: "tools/synthetic-tool.md", content: "# Synthetic tool behavior\nSYNTHETIC_CROSS_PROJECT_LESSON. Evidence: synthetic test output.", expectedHash: null } });
       }
       if (calls.length) {
         message.stopReason = "toolUse";
