@@ -128,6 +128,6 @@ test("synthetic detached-worker seam preserves cross-session evidence, correctio
   assert.equal(await readFile(sourceFile, "utf8"), sourceBytes);
   assert.deepEqual(first.getEntries(), firstEntries);
   assert.deepEqual(second.getEntries(), secondEntries);
-  assert.deepEqual(await readdir(config), []);
+  assert.deepEqual(await readdir(config), ["pi-memory-local-map.json"]);
   await fresh.event("session_shutdown", { reason: "quit" });
 });

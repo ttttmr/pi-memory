@@ -73,10 +73,53 @@ export async function recordMemoryTurn(
   }, signal);
 }
 
+/**
+ * Batch-fold multiple validated user messages in a single lock/write cycle (used when archiving
+ * legacy stores). Stops cleanly at session/counter capacity without discarding earlier messages.
+ */
+export async function recordMemoryTurns(
+  handle: MemoryStoreHandle,
+  turns: readonly (MemoryDreamSession & { entryId: string })[],
+  signal?: AbortSignal,
+): Promise<number> {
+  requireProjectSchedule(handle);
+  if (!turns.length) return 0;
+  return mutateMemorySchedule(handle, (state) => {
+    const seen = new Set(state.messages.map((message) => JSON.stringify([message.sessionId, message.entryId])));
+    const sessions = new Set(state.messages.map((message) => message.sessionId));
+    let added = 0;
+    for (const turn of turns) {
+      if (!isSessionReference(turn, ["entryId"]) || !isScheduleIdentifier(turn.entryId)) continue;
+      const key = JSON.stringify([turn.sessionId, turn.entryId]);
+      if (seen.has(key)) continue;
+      if (!sessions.has(turn.sessionId) && sessions.size >= MAX_SCHEDULE_SESSIONS) break;
+      if (!Number.isSafeInteger(state.observedTurns + 1)) break;
+      state.messages.push({ ...turn });
+      state.observedTurns++;
+      seen.add(key);
+      sessions.add(turn.sessionId);
+      added++;
+    }
+    return added;
+  }, signal);
+}
+
 /** Read pending work without creating a library, migrating on disk, or modifying leases. */
 export async function readMemorySchedule(handle: MemoryStoreHandle): Promise<MemoryScheduleSnapshot> {
   requireProjectSchedule(handle);
   return scheduleSnapshot(parseMemorySchedule(await readMemoryScheduleData(handle)));
+}
+
+/** Read observed project session IDs (including preserved legacy records) without creating storage. */
+export async function readMemoryScheduleSessionIds(handle: MemoryStoreHandle): Promise<Set<string>> {
+  requireProjectSchedule(handle);
+  const state = parseMemorySchedule(await readMemoryScheduleData(handle));
+  const ids = new Set<string>();
+  if (state.legacy) {
+    for (const session of state.legacy.sessions) ids.add(session.sessionId);
+  }
+  for (const message of state.messages) ids.add(message.sessionId);
+  return ids;
 }
 
 /** Read a live current or legacy lease without creating storage or modifying expired work. */
@@ -96,9 +139,10 @@ export async function claimMemoryDream(
 ): Promise<MemoryDreamClaim | null> {
   requireProjectSchedule(handle);
   if (!options || !isScheduleIdentifier(options.ownerId)) throw new Error("Memory schedule claim requires a valid ownerId");
-  return mutateMemorySchedule(handle, (state) => {
+  return mutateMemorySchedule(handle, async (state, context) => {
     const now = Date.now();
     if ((state.claim && state.claim.expiresAt > now) || (state.legacy?.claim && state.legacy.claim.expiresAt > now)) return null;
+    if (await context.hasActiveMerge()) return null;
     if (!scheduleSnapshot(state).due) return null;
     const sessions = new Map<string, MemoryDreamSession>();
     if (state.legacy && state.legacy.observedTurns > state.legacy.processedTurns) {
@@ -157,11 +201,13 @@ function scheduleSnapshot(state: MemoryScheduleState): MemoryScheduleSnapshot {
 }
 
 function mutateMemorySchedule<T>(
-  handle: MemoryStoreHandle, mutation: (state: MemoryScheduleState) => T, signal?: AbortSignal,
+  handle: MemoryStoreHandle,
+  mutation: (state: MemoryScheduleState, context: { hasActiveMerge: () => Promise<boolean> }) => Promise<T> | T,
+  signal?: AbortSignal,
 ): Promise<T> {
-  return withFileMutationQueue(handle.path, () => mutateMemoryScheduleData(handle, (data) => {
+  return withFileMutationQueue(handle.path, () => mutateMemoryScheduleData(handle, async (data, context) => {
     const state = parseMemorySchedule(data);
-    return { data: state, result: mutation(state) };
+    return { data: state, result: await mutation(state, context) };
   }, signal));
 }
 

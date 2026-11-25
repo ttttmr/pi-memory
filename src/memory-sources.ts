@@ -3,6 +3,7 @@ import { constants } from "node:fs";
 import { lstat, open, opendir, realpath } from "node:fs/promises";
 import { isAbsolute, join, resolve } from "node:path";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { isValidRemoteProjectIdentity } from "./memory-project.ts";
 import { resolveMemoryProject } from "./memory-store.ts";
 
 const MAX_SOURCE_PAGE_BYTES = 8 * 1024;
@@ -69,9 +70,12 @@ export function createMemorySourceProvider(options: {
   project: string;
   sessionRoots: string[];
   currentSession: ReadonlySessionManager;
+  /** Optional observed session IDs from this project's schedule, used only when a session's cwd no longer exists (ENOENT). */
+  knownSessionIds?: ReadonlySet<string>;
 }): MemorySourceProvider {
   const roots = [...options.sessionRoots];
   const project = options.project;
+  const knownSessionIds = options.knownSessionIds ? new Set(options.knownSessionIds) : undefined;
   const currentCwd = options.currentSession.getCwd();
   const currentSessionId = options.currentSession.getSessionId();
   // Project the branch synchronously, before a foreground append, tree change, or runtime teardown.
@@ -81,13 +85,17 @@ export function createMemorySourceProvider(options: {
 
   async function checkProject(signal?: AbortSignal): Promise<void> {
     signal?.throwIfAborted();
+    if (isValidRemoteProjectIdentity(project)) return;
     if (!isAbsolute(project) || resolve(project) !== project || await resolveMemoryProject(project) !== project) {
       throw new Error("Memory source project must be a canonical project identity");
     }
   }
 
-  async function currentSources(signal?: AbortSignal): Promise<SourceSession | null> {
-    if (!await matchesSourceProject(currentCwd, project, signal)) return null;
+  async function currentSources(
+    signal?: AbortSignal,
+    resolutionCache?: Map<string, Promise<string | "ENOENT" | null>>,
+  ): Promise<SourceSession | null> {
+    if (!await matchesSourceProject(currentCwd, project, signal, currentSessionId, knownSessionIds, resolutionCache)) return null;
     return { id: currentSessionId, entries: [], capturedSources };
   }
 
@@ -149,12 +157,18 @@ export function createMemorySourceProvider(options: {
       .map(([path]) => ({ path }))];
   }
 
-  async function load(candidate: SourceCandidate, warnings: Set<string>, signal?: AbortSignal,
-    targetId?: string, budget?: SourceScanBudget): Promise<SourceLoadResult> {
+  async function load(
+    candidate: SourceCandidate,
+    warnings: Set<string>,
+    resolutionCache: Map<string, Promise<string | "ENOENT" | null>>,
+    signal?: AbortSignal,
+    targetId?: string,
+    budget?: SourceScanBudget,
+  ): Promise<SourceLoadResult> {
     signal?.throwIfAborted();
-    if (candidate.current) return currentSources(signal);
+    if (candidate.current) return currentSources(signal, resolutionCache);
     try {
-      return await readSourceSession(candidate.path!, project, signal, targetId, budget);
+      return await readSourceSession(candidate.path!, project, signal, targetId, budget, knownSessionIds, resolutionCache);
     } catch (error) {
       if (signal?.aborted) throw error;
       warnings.add(error instanceof Error ? error.message : "Memory source file could not be read safely");
@@ -172,6 +186,7 @@ export function createMemorySourceProvider(options: {
       if (input.sessionId !== undefined) validateSourceIdentifier(input.sessionId);
       const warnings = new Set<string>();
       const files = await candidates(warnings, signal);
+      const resolutionCache = new Map<string, Promise<string | "ENOENT" | null>>();
       const sources: MemorySourceSearchPage["sources"] = [];
       const seen = new Set<string>();
       const terms = query.toLocaleLowerCase().match(/[\p{L}\p{N}_-]+/gu) ?? [];
@@ -186,7 +201,7 @@ export function createMemorySourceProvider(options: {
           nextOffset = fileIndex * SOURCE_CURSOR_STRIDE + entryIndex;
           break;
         }
-        const session = await load(files[fileIndex]!, warnings, signal, input.sessionId, budget);
+        const session = await load(files[fileIndex]!, warnings, resolutionCache, signal, input.sessionId, budget);
         scanned++;
         if (session === SOURCE_SCAN_DEFERRED) {
           nextOffset = fileIndex * SOURCE_CURSOR_STRIDE + entryIndex;
@@ -233,11 +248,12 @@ export function createMemorySourceProvider(options: {
       const startCharacter = sourceInteger(input.startCharacter ?? 0, "startCharacter");
       const warnings = new Set<string>();
       const files = await candidates(warnings, signal);
+      const resolutionCache = new Map<string, Promise<string | "ENOENT" | null>>();
       // Exact ID reads are not limited to the last search page or the recent-session scan budget.
       for (const candidate of files) {
         signal?.throwIfAborted();
-        const session = candidate.current ? await currentSources(signal) :
-          await readSourceSession(candidate.path!, project, signal, sessionId).catch((error: unknown) => {
+        const session = candidate.current ? await currentSources(signal, resolutionCache) :
+          await readSourceSession(candidate.path!, project, signal, sessionId, undefined, knownSessionIds, resolutionCache).catch((error: unknown) => {
             if (signal?.aborted) throw error;
             warnings.add(error instanceof Error ? error.message : "Memory source file unavailable");
             return null;
@@ -289,16 +305,53 @@ async function safeSourceDirectory(path: string): Promise<boolean> {
   } catch { return false; }
 }
 
-async function matchesSourceProject(cwd: string, project: string, signal?: AbortSignal): Promise<boolean> {
-  signal?.throwIfAborted();
-  if (typeof cwd !== "string" || !isAbsolute(cwd) || resolve(cwd) !== cwd) return false;
-  try {
-    return await realpath(cwd) === cwd && await resolveMemoryProject(cwd) === project;
-  } catch { return false; }
+async function resolveSourceCwdProject(
+  cwd: string,
+  cache?: Map<string, Promise<string | "ENOENT" | null>>,
+): Promise<string | "ENOENT" | null> {
+  if (cache) {
+    const cached = cache.get(cwd);
+    if (cached) return cached;
+  }
+  const promise = (async (): Promise<string | "ENOENT" | null> => {
+    let real: string;
+    try { real = await realpath(cwd); }
+    catch (error) {
+      if (error instanceof Error && "code" in error && error.code === "ENOENT") return "ENOENT";
+      return null;
+    }
+    if (real !== cwd) return null;
+    try { return await resolveMemoryProject(cwd); }
+    catch { return null; }
+  })();
+  cache?.set(cwd, promise);
+  return promise;
 }
 
-async function readSourceSession(path: string, project: string, signal?: AbortSignal, targetId?: string,
-  budget?: SourceScanBudget): Promise<SourceLoadResult> {
+async function matchesSourceProject(
+  cwd: string,
+  project: string,
+  signal?: AbortSignal,
+  sessionId?: string,
+  knownSessionIds?: ReadonlySet<string>,
+  cache?: Map<string, Promise<string | "ENOENT" | null>>,
+): Promise<boolean> {
+  signal?.throwIfAborted();
+  if (typeof cwd !== "string" || !isAbsolute(cwd) || resolve(cwd) !== cwd) return false;
+  const resolved = await resolveSourceCwdProject(cwd, cache);
+  if (resolved === "ENOENT") return Boolean(sessionId && knownSessionIds?.has(sessionId));
+  return resolved === project;
+}
+
+async function readSourceSession(
+  path: string,
+  project: string,
+  signal?: AbortSignal,
+  targetId?: string,
+  budget?: SourceScanBudget,
+  knownSessionIds?: ReadonlySet<string>,
+  resolutionCache?: Map<string, Promise<string | "ENOENT" | null>>,
+): Promise<SourceLoadResult> {
   signal?.throwIfAborted();
   // Validate all path components, then refuse final-component symlinks at open time as well.
   if (await realpath(path) !== path) throw new Error("Memory source native file is unsafe (symlink)");
@@ -325,7 +378,7 @@ async function readSourceSession(path: string, project: string, signal?: AbortSi
     validateSourceIdentifier(header.id);
     if (targetId && header.id !== targetId) return null;
     // Header identity is checked before reading transcript bodies, regardless of directory names.
-    if (typeof header.cwd !== "string" || !await matchesSourceProject(header.cwd, project, signal)) return null;
+    if (typeof header.cwd !== "string" || !await matchesSourceProject(header.cwd, project, signal, header.id, knownSessionIds, resolutionCache)) return null;
     if (stat.size > MAX_SESSION_BYTES) throw new Error("Memory source native file exceeds 16 MiB; truncated scan refuses incomplete privacy edits");
     if (budget) {
       if (stat.size > budget.remaining) return SOURCE_SCAN_DEFERRED;

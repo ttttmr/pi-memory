@@ -88,7 +88,7 @@ pi --pi-memory-no-recall --pi-memory-no-dream
 
 ## 存储位置与备份
 
-默认根目录通常为 `~/.pi/agent/pi-memory`，实际位置为 Pi 的 Agent 目录下的 `pi-memory/`。其下是项目目录 `project-<hash>/` 和全局目录 `global/`。可以用 `PI_MEMORY_DIR` 指定其他位置，建议使用绝对路径：
+默认根目录通常为 `~/.pi/agent/pi-memory`，实际位置为 Pi 的 Agent 目录下的 `pi-memory/`。其下是可读的项目目录 `<slug>-<hash16>/` 和全局目录 `global/`。本机路径映射另存于 `getAgentDir()/pi-memory-local-map.json`（位于 `PI_MEMORY_DIR` 之外，避免跨机同步冲突）。可以用 `PI_MEMORY_DIR` 指定其他位置，建议使用绝对路径：
 
 ```bash
 PI_MEMORY_DIR=/absolute/path/to/memory \
@@ -97,9 +97,9 @@ PI_MEMORY_DIR=/absolute/path/to/memory \
 
 记录项目细节时使用项目记忆；只有真正跨项目、非私密的知识才适合放进全局。可以用自然语言告诉 Agent 保存到哪个范围。
 
-同一 Git 项目的子目录共用项目记忆，独立 worktree 和不同位置的克隆分开。移动项目目录会改变记忆归属，不会自动搬迁文件。具体定位规则见[设计说明](design.zh-CN.md#两个作用域怎样定位)。
+同一 Git 项目的子目录、关联 worktree，以及指向同一归一化 `origin` 远程的不同克隆目录共用同一份项目记忆（支持解析 `~/.ssh/config` 中的 SSH `Host` 别名）。旧版 `project-<hash>/` 目录以及后来添加或修改 `origin` 远程的本地仓库可继续读取并在下次写入时自动迁移。若本机存在多个同仓库的旧目录或并行检出库（例如升级前主仓库、多个 worktree 或不同克隆目录各自建过库），前台会立即在主目录正常工作，并在受信任会话完成首轮后由独立的机制触发合并任务（区别于常规 dreaming）自动整合含笔记的多余旧目录，完成后将原目录原子归档至 `<主目录>/.merged-legacy/`（不含笔记的空旧目录会零模型开销自动归档；设 `--pi-memory-no-dream` 时不启动后台合并 worker 仅提示一次）。非 Git 项目仍按规范路径定位，移动非 Git 目录会改变记忆归属。具体定位规则见[设计说明](design.zh-CN.md#两个作用域怎样定位)。
 
-备份前确认所有写入者均已停止，包括独立的后台 worker；仅关闭前台 Pi 不够，先检查运行记录。复制完整存储根目录，包括隐藏文件与历史。各作用域的 `.dream-runs/<run>/` 保存私有的 `status.json`、`events.jsonl`、`supervisor.log` 和 `sessions/` 下的 worker 原生会话，可能包含原始敏感工具文本，需与笔记和备份一起保护。归档笔记不是永久删除，也不会清理已有会话、备份或提供商副本。
+备份前确认所有写入者均已停止，包括独立的后台 dreaming 与旧库合并 worker；仅关闭前台 Pi 不够，先检查运行记录。复制完整存储根目录，包括隐藏文件与历史。各作用域的 `.dream-runs/<run>/` 及项目的 `.merge-runs/<run>/` 保存私有的 `status.json`、`events.jsonl`、`supervisor.log` 和 `sessions/` 下的 worker 原生会话，可能包含原始敏感工具文本，需与笔记和备份一起保护。归档笔记不是永久删除，也不会清理已有会话、备份或提供商副本。
 
 ## 故障排查
 
@@ -114,6 +114,8 @@ PI_MEMORY_DIR=/absolute/path/to/memory \
 | 哈希冲突 | 让 Agent 重读并比较新内容，再决定如何合并，不强行覆盖 |
 | 记忆锁冲突 | 笔记写入需等写入者结束后重试；交互计数会在当前进程中排队，锁释放后自动补记，不抢锁。退出时若提示计数尚未保存，不要把它当成已落盘；崩溃遗留锁需确认没有写入者后再人工处理 |
 | identity、路径或文件校验失败 | 停止写入并保留原文件，检查归属和结构，不清空目录绕过错误 |
+| 升级后仍有未合并的旧目录/同仓库目录 | 在未设 `--pi-memory-no-dream` 的受信任会话中完成一轮正常交互即可触发后台旧库合并任务，可查看 `<主目录>/.merge-state.json` 与 `<主目录>/.merge-runs/`；合并完成的原目录保留在 `<主目录>/.merged-legacy/`。若旧目录记录的本机路径已不存在（如已删 worktree 或其他机器路径），程序无法证明归属，会原样保留 |
+| 本机路径映射损坏 | 检查并修复或显式删除 `getAgentDir()/pi-memory-local-map.json`；删除映射文件不会删除任何 Markdown 笔记 |
 | 容量或历史上限 | 先停止写入并备份，再按[存储限制](design.zh-CN.md#归档与容量)处理；归档也需要历史空间 |
 | 全局整理没启动 | 需要在受信任的前台开启自动整理，全局至少有 3 个 Markdown 文件，并满足 7 天/30 天和 6 小时退避条件。查看 `global/.dream-state.json` 和 `global/.dream-runs/` |
 | 自动整理没启动 | 检查启动参数、项目权限与当前模型；同项目需累计 50 条尚未处理的实际用户消息，或存在到期的迁移 legacy 工作；启动时已有历史不计数。检查 `.dream-state.json` 与 `.dream-runs/`，有效项目租约会阻止重复启动。退出期间未启动的工作等待，已运行的 worker 可以继续 |

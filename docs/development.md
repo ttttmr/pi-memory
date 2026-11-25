@@ -38,10 +38,14 @@ npm pack --dry-run
 | `src/memory-extension.ts` | Markdown tools, command, switches, context injection, and background scheduling |
 | `src/memory-history.ts` | Foreground session history tool schemas, trust check, and provider setup |
 | `src/memory-schema.ts` | Markdown writing-tool parameters and scope types |
-| `src/memory-store.ts` | Project resolution, active-file reads and writes, hash conflicts, history, locks, and atomic replacement |
+| `src/memory-project.ts` | Git worktree/submodule resolution, `origin` URL and SSH alias normalization, readable directory names, device-local identity map, and matching store discovery |
+| `src/memory-store.ts` | Store handles, deterministic read fallback, write-time directory promotion, legacy archival primitives, active-file reads and writes, hash conflicts, history, locks, and atomic replacement |
 | `src/memory-search.ts` | Lexical search, file listing, and compact index context |
-| `src/memory-dream.ts` | Detached supervisor launch, deadline enforcement, and private run records |
-| `src/memory-dream-worker.ts` | Normal Agent maintenance prompt and worker-owned completion acknowledgment |
+| `src/memory-worker-launch.ts` | Shared detached POSIX supervisor, deadline enforcement, descendant cleanup, and worker launch |
+| `src/memory-dream.ts` | Detached dreaming launch checks and private run records |
+| `src/memory-dream-worker.ts` | Normal Agent dreaming prompt and worker-owned completion acknowledgment |
+| `src/memory-merge.ts` | Mechanism-triggered same-repository store merge coordination, zero-LLM fast paths, lease/backoff, and fingerprint-verified archival |
+| `src/memory-merge-worker.ts` | Dedicated project-only store-merge worker extension and finalization |
 | `src/memory-sources.ts` | Read-only native session provider for foreground history; not used for dreaming |
 | `src/memory-schedule.ts` | Persistent actual-user-message ID deduplication, session batches, legacy migration, leases, and generation acknowledgment |
 | `src/memory-observations.ts` | Ordered commits of user-message observations, wake-up on lock-release events, and retention on failure |
@@ -54,7 +58,8 @@ Tests live beside their modules as `src/*.test.ts`. Synthetic fixtures live in `
 
 | Area | Main assertions |
 | --- | --- |
-| Storage | Project/global isolation, path and identity validation, plaintext Markdown, hash conflicts, history retention and capacity, locks, cancellation, and atomic replacement |
+| Storage | Project/global isolation, Git worktree/bare-repo/submodule identity resolution, `origin` URL and `~/.ssh/config` alias normalization, readable directory names, device-local map, deterministic read fallback and dual-lock write migration, sibling/legacy store discovery, active-lease/lock/corruption fail-closed handling, path and identity validation, plaintext Markdown, hash conflicts, history retention and capacity, locks, cancellation, and atomic replacement |
+| Store merge | Mechanism-triggered same-repo consolidation distinct from dreaming: zero-LLM sole-clone promotion and empty-store archival with v2 schedule folding, project-only merge worker refusing global scope, mutual exclusion with project dreaming, retry backoff invalidated by content changes, fingerprint-checked atomic archival into `.merged-legacy/` with `.merge-manifest.json`, and `--pi-memory-no-dream` opt-out notice |
 | Search and index | English words and Han/kana bigram search, listing without a query, injection of only MEMORY.md rather than matching note content, budgets, and temporary context |
 | Foreground Markdown interfaces | Three tool schemas, defaults, lightweight purpose and autonomous-selection guidance, no fixed content template, retained tool-operation instructions; Unicode code-point pagination within line ranges, 8 KiB page caps, long single-line reads, complete JSON output, autonomous global writes, project trust, and metadata-only write receipts; usage for empty `/memory`, verbatim forwarding, and busy follow-up behavior for the sole command, without old command aliases or management subcommands |
 | Background scheduling | Baseline existing user IDs at session startup; count only new actual user messages at settlement; durable per-ID deduplication across sessions; claim at 50 pending messages without prior notes; session ID/file hints; v1 pending turns migrate as one-shot legacy work, not actual user counts; independent flags, no manual trigger, and no store creation on read-only startup |

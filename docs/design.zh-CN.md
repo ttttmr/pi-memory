@@ -72,7 +72,7 @@ pi-memory 的持久知识是 Markdown，模型通过读取文件获得这些知�
 
 ### 模型可以回查同项目会话历史
 
-笔记缺少细节或需要核对来源时，前台模型可以用 `memory_history_search` 和 `memory_history_read`。会话文本不会自动注入。每次调用都检查 Pi 项目信任，解析当前项目的规范 identity，并读取当前会话活动分支的最新快照。工具在 Pi 标准会话根目录及当前会话的自定义目录（若已设置）中查找文件，读取正文前先校验文件头的 `cwd` 是否属于同一项目。不建立会话索引，也不保留副本。
+笔记缺少细节或需要核对来源时，前台模型可以用 `memory_history_search` 和 `memory_history_read`。会话文本不会自动注入。每次调用都检查 Pi 项目信任，解析当前项目的规范 identity，并读取当前会话活动分支的最新快照。工具在 Pi 标准会话根目录及当前会话的自定义目录（若已设置）中查找文件，读取正文前先校验文件头的 `cwd` 是否属于同一项目 identity——因此关联 worktree 与同远程克隆的会话可互通；已删除 worktree 的历史会话只要其会话 ID 曾记录在本项目的 `.dream-state.json` 中仍可被发现。不建立会话索引，也不保留副本。
 
 历史文件按最后一条条目的父链读取，不查询任意分支。工具应用该分支上的上下文编辑，只返回允许的文本字段和来源信息，不搜索该投影中的隐藏或已删除文本。文件发现和扫描均有上限，空结果不证明来源不存在。扫描游标、读取分页及结果限制见[工具参考](tools.zh-CN.md#前台会话历史)。
 
@@ -190,18 +190,31 @@ worker 拥有普通默认工具（`read`、`bash`、`edit`、`write`）、Markdo
 
 ### 两个作用域怎样定位
 
-存储根目录为 `PI_MEMORY_DIR`，未设置时为 `getAgentDir()/pi-memory`。其下直接是 `project-<hash>/` 和 `global/`，二者都可以包含 `MEMORY.md`、主题笔记、`.identity.json`、`.history/`、`.access.json` 读取统计、`.dream-state.json` 调度文件与 `.dream-runs/` 运行记录，内部文件不参与笔记搜索或自动召回。`topics/`、`notes/` 只是模型组织内容的目录名，不是程序规定的分类。
+存储根目录为 `PI_MEMORY_DIR`，未设置时为 `getAgentDir()/pi-memory`。其下直接是可读的项目目录（`<slug>-<hash16>/`）和 `global/`，二者都可以包含 `MEMORY.md`、主题笔记、`.identity.json`、`.history/`、`.access.json` 读取统计、`.dream-state.json` 调度文件与 `.dream-runs/` 运行记录，内部文件不参与笔记搜索或自动召回。`topics/`、`notes/` 只是模型组织内容的目录名，不是程序规定的分类。
 
-项目 identity 的计算顺序：当前目录先执行 `realpath`，向上找最近的 `.git` 标记，以其所在目录为项目根；没有标记则用当前真实目录。只检查标记存在，不执行 Git，不读取标记内容。
+项目 identity 的计算顺序（全程不执行 `git` 命令）：
+
+1. 对当前目录执行 `realpath`，向上找最近的 `.git` 标记；若不存在，则使用当前真实目录路径。
+2. 若 `.git` 是普通目录，其父目录为本地仓库根，`.git` 为公共 Git 目录。
+3. 若 `.git` 是普通文件（`gitdir: ...`），不跟随符号链接并做双向回指校验：关联 worktree 须同时包含 `commondir` 且其 `gitdir` 文件回指当前 worktree 的 `.git`（与主仓库或 bare 仓库共用同一本地仓库根）；子模块与 `--separate-git-dir` 须在对应配置中有匹配的 `core.worktree` 回指（与上层仓库隔离）。校验不通过或 `.git` 为符号链接时，安全回退到标记所在目录本身。
+4. 读取公共 Git 目录下的 `config` 中的 `remote.origin.url`（忽略本地路径远程）。归一化 `https`、`http`、`ssh`、`git` 及 SCP 风格 URL：去掉凭据与默认端口，通过只读有界解析 `~/.ssh/config`（支持 `Include`、跳过 `Match`）展开 OpenSSH `Host` 别名，并对已知大小写不敏感的托管主机（`github.com`、`gitlab.com`、`bitbucket.org`、`codeberg.org`、`gitee.com`）将仓库路径小写化，得到 `git:<host[:port]>/<path>`。
+5. 若没有可用的远程 `origin` URL，则回退为规范化的本地仓库根（所有关联 worktree 共享）或当前真实目录。
 
 代码中有两种 SHA-256，作用不同：
 
 | 名称 | 输入 | 用途 |
 | --- | --- | --- |
-| 项目目录的 `<hash>` | 项目 identity 的绝对路径，UTF-8 编码 | 生成固定目录名，完整 64 位十六进制，不是 Git commit 或内容身份 |
+| `<slug>-<hash16>` 中的 `<hash16>` | 项目 identity（`git:<host>/<path>` 或规范本地路径），UTF-8 编码 | 与清洗后的可读 slug 组合的 16 位十六进制防冲突后缀（迁移前的旧目录格式为 `project-<64位十六进制>`） |
 | 笔记的 `hash`、写入的 `expectedHash` | 当前 Markdown 文件的完整 UTF-8 内容 | 检查读后是否有人修改，和只返回了哪一页内容无关 |
 
-同一 Git 项目的子目录共用记忆，不同位置的克隆和独立 worktree 分开。非 Git 项目进入子目录可能得到不同 identity，移动项目也会改变归属。哈希不匿名化路径，归属元数据仍保存实际 identity。
+同一 Git 仓库的子目录、关联 worktree，以及指向同一归一化 `origin` 远程的不同克隆目录，共用同一份项目记忆。独立 dreaming worker 会同时获得逻辑项目 identity 与受信任检出的工作目录（`workerCwd`）。非 Git 目录仍按规范路径定位，进入子目录会产生不同 identity。哈希不匿名化 identity，`.identity.json` 仍保存完整归属字符串。
+
+为保持升级与仓库演进时的连续性（旧版 `project-<64位十六进制>/`、本地目录 -> `git init` -> 添加 `origin`、或更改 `origin` URL），在 `getAgentDir()/pi-memory-local-map.json`（位于 `PI_MEMORY_DIR` 之外，避免跨机同步污染）维护本机映射，记录各本地仓库根最近对应的 identity 与目录名。只读操作按确定性优先级回退到首选已有目录（主目录优先，其次本机映射、主仓库与关联 worktree）且不改磁盘；首次写入按确定性顺序双锁并原子升格该首选旧目录为主目录 `<slug>-<hash16>/`，更新 `.identity.json` 与本机映射，其余同仓库旧目录保持不动。若所选旧目录持有活跃 dreaming 租约则延迟迁移；本机映射损坏时仍 fail-closed 报错而非新建重复库。
+
+当本机存在多个同仓库目录时（例如升级前主仓库与多个 worktree 各自建过库、同一归一化 `origin` 的多个本地克隆，或跨机同步已带来主目录而本机仍留有旧 `project-<64位十六进制>/`），前台会话直接在主目录正常工作，不再因冲突报错卡住。在受信任项目完成实际用户轮次后，独立的机制触发合并协调器（区别于常规 dreaming）会扫描 `PI_MEMORY_DIR` 下本机仍存在且 `.identity.json` 可证明解析到同一逻辑仓库的其他目录（绝不猜测不存在路径、子模块或符号链接）：
+
+- **零模型快路径**：若主目录尚不存在且只命中一个同仓库目录，直接原子升格为主目录；若多余旧目录不含任何活动 Markdown 笔记，则直接原子归档至 `<主目录>/.merged-legacy/`，并尽力将其未处理的 v2 `.dream-state.json` 用户消息记录折入主目录。
+- **专属后台合并 worker**：若一个或多个多余旧目录包含活动 Markdown 笔记（且未设 `--pi-memory-no-dream`），则启动独立的 detached 合并 worker（`memory-merge-worker.ts`，私有运行记录在 `.merge-runs/`，在 `.merge-state.json` 持有 1830 秒独立租约、与项目 dreaming 互斥，未变化来源失败后退避 1 小时）。该 worker 仅限项目作用域（拒绝访问全局记忆、不扫描会话历史），只读读取各旧目录笔记，通过 `memory_write` 将非重复知识整合进主目录，禁止修改或删除旧目录。仅在 30 分钟期限内正常完成后，程序才会逐一复核各旧目录的活动笔记指纹，仅将未发生并发改动的旧目录原子移入 `<主目录>/.merged-legacy/<原目录名>-<时间戳>-<短ID>/` 并写入 `.merge-manifest.json`；若期间有并发写入或任务失败，旧目录原样留在根目录等待后续合并。
 
 项目访问要求 Pi 项目信任。前台读取、写入默认使用项目，搜索默认使用项目与全局；全局适合跨项目、非私密知识。记忆里的历史授权不扩大当前任务权限，这些接口也不是宿主 shell 或其他扩展的文件系统沙箱。
 

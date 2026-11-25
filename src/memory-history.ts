@@ -1,8 +1,9 @@
 import { join } from "node:path";
 import { getAgentDir, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import { readMemoryScheduleSessionIds } from "./memory-schedule.ts";
 import { createMemorySourceProvider } from "./memory-sources.ts";
-import { resolveMemoryProject } from "./memory-store.ts";
+import { defaultLocalMemoryMapPath, resolveMemoryProjectHandle } from "./memory-store.ts";
 import { memoryToolResult } from "./memory-tool-result.ts";
 
 const historySearchSchema = Type.Object({
@@ -19,13 +20,22 @@ const historyReadSchema = Type.Object({
 async function historyProviderFor(ctx: ExtensionContext, signal?: AbortSignal) {
   signal?.throwIfAborted();
   if (!ctx.isProjectTrusted()) throw new Error("Memory session history requires Pi project trust");
-  const project = await resolveMemoryProject(ctx.cwd);
+  const agentDir = getAgentDir();
+  const root = process.env.PI_MEMORY_DIR || join(agentDir, "pi-memory");
+  const { handle, project } = await resolveMemoryProjectHandle(root, ctx.cwd, {
+    localMapPath: defaultLocalMemoryMapPath(agentDir),
+    bindLocalMap: false,
+  });
+  signal?.throwIfAborted();
+  // Read observed session IDs (best effort) so sessions from deleted worktrees remain discoverable.
+  const knownSessionIds = await readMemoryScheduleSessionIds(handle).catch(() => new Set<string>());
   signal?.throwIfAborted();
   const sessionDir = ctx.sessionManager.getSessionDir();
   return createMemorySourceProvider({
-    project,
-    sessionRoots: [join(getAgentDir(), "sessions"), ...(sessionDir ? [sessionDir] : [])],
+    project: project.identity,
+    sessionRoots: [join(agentDir, "sessions"), ...(sessionDir ? [sessionDir] : [])],
     currentSession: ctx.sessionManager,
+    knownSessionIds,
   });
 }
 

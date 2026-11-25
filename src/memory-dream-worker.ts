@@ -12,8 +12,10 @@ import type { MemoryDreamWorkerConfig } from "./memory-dream.ts";
 
 /** The independent Agent receives session IDs and locations, not preselected excerpts or a transcript copy. */
 export function buildMemoryDreamPrompt(config: MemoryDreamWorkerConfig, sessions: MemoryDreamSession[], accessSummary = ""): string {
+  const workingDirLine = config.workerCwd && config.workerCwd !== config.handle.identity
+    ? `\nProject working directory: ${JSON.stringify(config.workerCwd)}` : "";
   return `You are an independent Pi Agent assigned to MEMORY DREAMING for one project (its project memory, plus cross-project global memory), not the foreground user's coding task.
-Project: ${JSON.stringify(config.handle.identity)}
+Project: ${JSON.stringify(config.handle.identity)}${workingDirLine}
 Project memory directory: ${JSON.stringify(config.handle.directory)}
 Started at: ${new Date(config.deadline - 30 * 60 * 1000).toISOString()}
 Hard wall-clock deadline: ${new Date(config.deadline).toISOString()} (30 minutes total, including startup). You may finish earlier. There is no dreaming-specific model-request or tool-call quota. Your process will be terminated at the deadline; finish useful work and leave a brief honest report before then. Ordinary model, context, tool, and provider limits still apply.
@@ -108,6 +110,7 @@ export default function memoryDreamWorker(pi: ExtensionAPI): void {
         claim = await claimGlobalMemoryDream(config.handle, { ownerId: randomUUID() });
         if (claim) accessSummary = await describeMemoryAccess(config.handle, "Global memory");
       } else {
+        // claimMemoryDream checks active store-merge leases atomically under the same store lock.
         claim = await claimMemoryDream(config.handle, { ownerId: randomUUID() });
         if (claim) {
           const globalHandle = createMemoryStoreHandle(join(config.handle.directory, ".."), "global", "global");

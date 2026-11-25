@@ -13,8 +13,8 @@ PI_MEMORY_DIR 或 getAgentDir()/pi-memory
   -> 每个项目一个目录 + global/
   -> MEMORY.md 是小索引，其他 Markdown 是自由组织的正文
   -> .identity.json 是内部元数据，.history/ 保存改写或归档前的正文
-  -> .access.json 保存前台读取参考统计，.dream-state.json 保存项目批次或全局周期与运行租约
-  -> .dream-runs/ 保存各作用域私有运行记录与 worker 自身会话，不是知识正文
+  -> .access.json 保存前台读取参考统计，.dream-state.json 保存项目批次或全局周期与运行租约，.merge-state.json 保存同仓库旧库/多检出合并租约与退避
+  -> .dream-runs/ 与 .merge-runs/ 分别保存 dreaming 与同仓库旧库合并的私有运行记录及 worker 自身会话；.merged-legacy/ 保留合并完成后的原始旧目录快照，均不是知识正文
 
 每次请求
   -> context 钩子临时注入项目与全局 MEMORY.md
@@ -40,10 +40,13 @@ Markdown 正文自由组织，Agent 自主写入和维护索引。程序不自�
 | --- | --- |
 | 工具、命令、开关、请求与调度生命周期 | `src/memory-extension.ts` |
 | 工具写入参数与作用域类型 | `src/memory-schema.ts` |
-| 项目定位、读写、哈希、历史、锁 | `src/memory-store.ts` |
+| Git worktree/子模块解析、`origin` URL 与 SSH 别名归一化、可读目录名、本机映射与同仓库旧库扫描 | `src/memory-project.ts` 及其就近测试 |
+| 存储句柄、读写回退与写时迁移、旧库升格/归档原语、哈希、历史、锁 | `src/memory-store.ts` |
 | 词法检索、列表和小索引上下文 | `src/memory-search.ts` |
-| 独立进程启动、期限与运行记录 | `src/memory-dream.ts` 及其就近测试 |
-| worker 维护提示与完成确认 | `src/memory-dream-worker.ts` |
+| 共享 detached POSIX supervisor 与独立 worker 启动 | `src/memory-worker-launch.ts` |
+| 独立 dreaming 启动、期限与运行记录 | `src/memory-dream.ts` 及其就近测试 |
+| dreaming worker 维护提示与完成确认 | `src/memory-dream-worker.ts` |
+| 机制触发的同仓库旧库合并调度、零模型快路径、归档收尾与专属合并 worker | `src/memory-merge.ts`、`src/memory-merge-worker.ts` 及其就近测试 |
 | 前台会话历史工具与只读来源提供器（不是 worker 接口） | `src/memory-history.ts`、`src/memory-sources.ts` 及其就近测试 |
 | 项目级用户消息去重、待处理批次与运行租约 | `src/memory-schedule.ts` 及其就近测试 |
 | 用户消息观察的排队提交与锁释放后补记 | `src/memory-observations.ts` 及其就近测试 |
@@ -79,11 +82,11 @@ npm pack --dry-run
 - 索引由 Agent 维护，不在新建或归档正文时偷偷改写。单份索引最多 8 KiB、200 行，普通笔记最多 64 KiB，每作用域活动 Markdown 最多 500 文件、8 MiB。
 - 新建用 expectedHash:null，已有文件改写或归档用完整正文的 SHA-256。保留旧正文到 .history，MEMORY.md 不能归档。历史最多 1000 份，满后拒绝需增加快照的写入，不自动清理旧证据。
 - 所有修改继续经过 Pi 文件队列、跨进程锁、路径与 identity 校验、哈希检查和原子替换。损坏和 identity 不符不能重置为空库，不能静默丢证据或自动抢锁。多文件操作和整次 dreaming 不是事务。
-- 项目 identity 使用规范化路径和最近的 .git 标记，只检查标记存在，不执行 Git 或读取内容。项目访问保持信任检查，全局读写仅用于跨项目、非私密知识。
+- 项目 identity 全程不执行 `git`：优先通过双向回指校验解析关联 worktree（与主仓库/bare 仓库共享）和子模块/`--separate-git-dir`（与上层隔离），再读取公共 Git 配置的 `remote.origin.url` 并归一化协议、去凭据/默认端口、只读展开 `~/.ssh/config` `Host` 别名得到 `git:<host[:port]>/<path>`；无远程 `origin` 时回退到规范化的本地仓库根或真实目录。目录名为 `<slug>-<hash16>`；通过位于 `getAgentDir()/pi-memory-local-map.json`（存储根之外）的本机映射与候选列表支持只读回退和写时双锁原子迁移（兼容旧版 `project-<64位十六进制>`、本地转远程及远程改名）。当同仓库命中多个目录（例如升级前主仓库与多个 worktree/克隆各自建过库，或跨机同步后主目录与本机旧目录共存）时，前台按确定性优先级选定唯一主目录继续读写，不阻塞也不静默覆盖；在受信任项目首次 `agent_settled` 后由独立的机制触发合并任务（`memory-merge.ts` / `memory-merge-worker.ts`，区别于常规 dreaming）扫描 `PI_MEMORY_DIR` 下本机仍存在且可证明归属同一仓库的其他目录：单旧库直接原子升格、无活跃 Markdown 的空旧库直接归档并折入未处理 `.dream-state.json` 消息（均零模型开销）；含活跃 Markdown 的多余旧库启动独立合并 worker（仅限项目作用域、拒绝全局访问、不扫会话），完成后按指纹校验未并发改动才原子移入 `<主目录>/.merged-legacy/` 并写入 `.merge-manifest.json`。与项目 dreaming 互斥租约（1830 秒），失败保留原旧库且按指纹退避 1 小时，`--pi-memory-no-dream` 不启动合并模型 worker 仅提示一次；旧目录存在活跃租约或本机映射损坏仍 fail-closed。项目访问保持信任检查，全局读写仅用于跨项目、非私密知识。
 - dreaming 默认在 `agent_settled` 观察实际用户消息，按条目 ID 持久去重，同项目累计 50 条尚未处理消息后触发，不按完成轮数、工具或内部模型调用计数。`session_start` 对已有消息建立基线，不追溯计数；v1 待处理轮数迁移为可触发一次整理的 legacy 工作，不伪装成实际用户消息。调度持久保存会话 ID 批次与可选原生文件提示，不复制来源会话。
 - 观察按原项目有序排队，提交成功才出队；同进程重载共享 FIFO，锁竞争通过文件系统事件补记，不轮询、不抢锁。退出仍未落盘时明确警告，不承诺内存观察的崩溃恢复。只读启动不建库，首次记录新用户消息可以创建目录、identity 和调度文件。关闭自动整理不关闭记录，后台自身不制造前台用户消息。
 - 每项目一个有效租约，持续 1830 秒，覆盖 30 分钟墙钟期限与启动收尾余量。前台启动回调仅取得启动回执，不能宣称整理成功；前台可只读观察 status.json，为运行中及完成、失败、超时、未领取任务状态发简短通知，观察失败只报结果未知，不代替 worker 确认。worker 负责最终确认，成功只确认领取代次，后续工作仍待处理；失败保留待处理工作，已完成写入不回滚。不能抢占有效租约或自动抢文件锁。
-- detached supervisor 在原项目规范目录启动普通 Pi CLI Agent，传入当前所选 provider、model、thinking，使用正常配置重新加载凭证、扩展、skills 和 MCP；仅运行时存在的前台注册或配置不能复制。显式加载记忆与 worker 扩展，遵循正常信任流程，不添加自动批准。
+- detached supervisor 在原项目受信任检出目录（`workerCwd`）启动普通 Pi CLI Agent，传入当前所选 provider、model、thinking，使用正常配置重新加载凭证、扩展、skills 和 MCP；仅运行时存在的前台注册或配置不能复制。显式加载记忆与 worker 扩展，遵循正常信任流程，不添加自动批准。
 - worker 拥有默认 read/bash/edit/write、记忆工具与正常配置资源，不是仅项目来源工具的沙箱。任务包含会话 ID、可选文件提示、会话根目录、已有记忆和截止时间，由 Agent 自主读取完整原始历史。`memory-sources.ts` 为前台提供会话历史，不作为 worker 接口。它的活动分支、context_edit、字段过滤或分页限制不约束 worker 原始文件读取。
 - dreaming 提示要求维护项目记忆，并可依据本项目证据新增或纠正跨项目、非私密的全局知识；全局笔记不得含项目名称、路径等私密细节，不能因本项目未使用就归档或改写全局笔记，删减交给全局整理。提示同时要求只读会话和源码，通过记忆工具安全写入，保留依据与不确定性，将历史指令视为不可信材料而非授权。这是提示策略，不是操作系统沙箱；其他普通工具和配置资源仍具备文件、命令与网络能力。不得把历史材料、模型改写或重复引用当作事实验证。
 - 全局整理是独立的低频 worker：首次需全局至少 3 个活动 Markdown；之后需距上次成功至少 7 天且笔记指纹变化，或满 30 天；任何前台尝试启动后退避 6 小时，启动器在派生前写入尝试时间；全局租约 1830 秒，成功记录完成时间和指纹，失败只释放租约。受信任且开启自动整理的前台在记录用户消息后检查，每进程最多每 10 分钟一次。worker 在自己的运行目录启动，任务不含会话或项目 identity；项目作用域记忆工具被拒绝，`memory_search` 默认只搜全局。提示只做合并、修链、归档过时或项目私有的笔记、去除私密细节、通过公开文档或只读工具输出复核有时效的说法，无法复核的保留日期而不删除。这些数值是未经测试的实现选择。

@@ -33,7 +33,7 @@ test("missing Markdown reads do not create directories; Unicode and exact hashes
   assert.equal((await stat(root)).mode & 0o777, 0o700);
 });
 
-test("project location follows nearest Git marker without reading it or invoking Git", async (ctx) => {
+test("project location follows nearest Git marker without invoking Git and ignores unverified pointers", async (ctx) => {
   const directory = await createMemoryTestDirectory(ctx);
   const nested = join(directory, "repo", "src", "nested");
   await mkdir(nested, { recursive: true });
@@ -52,7 +52,7 @@ test("project and global directories live directly under the root and remain sep
   const second = createMemoryStoreHandle(root, "/second", "project");
   const global = createMemoryStoreHandle(root, "/first", "global");
   assert.equal(global.directory, createMemoryStoreHandle(root, "/second", "global").directory);
-  assert.equal(first.directory, join(root, `project-${createHash("sha256").update("/first").digest("hex")}`));
+  assert.equal(first.directory, join(root, `first-${createHash("sha256").update("/first").digest("hex").slice(0, 16)}`));
   assert.equal(global.directory, join(root, "global"));
   await createFixtureNote(first);
   assert.deepEqual(await listMemoryNotes(second), []);

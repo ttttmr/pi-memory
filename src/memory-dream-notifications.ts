@@ -9,18 +9,20 @@ export interface MemoryDreamNotification {
   type: "info" | "warning" | "error";
 }
 
-/** Watch one launched run without polling or keeping the foreground alive; abort only stops observation. */
+/** Watch one launched background run without polling or keeping the foreground alive; abort only stops observation. */
 export function watchMemoryDreamStatus(
   directory: string,
   deadline: number,
   notify: (notification: MemoryDreamNotification) => void,
   signal: AbortSignal,
+  kind: "dream" | "merge" = "dream",
 ): void {
   if (signal.aborted) return;
   let closed = false;
   let inspecting = false;
   let dirty = false;
   const seen = new Set<string>();
+  const label = kind === "merge" ? "Memory store merge" : "Memory dreaming";
   const close = () => {
     if (closed) return;
     closed = true;
@@ -31,7 +33,7 @@ export function watchMemoryDreamStatus(
   const unavailable = () => {
     if (closed) return;
     close();
-    notify({ state: "unavailable", type: "warning", message: `Memory dreaming status monitoring unavailable; completion is unknown. Run status and logs: ${directory}` });
+    notify({ state: "unavailable", type: "warning", message: `${label} status monitoring unavailable; completion is unknown. Run status and logs: ${directory}` });
   };
   const watcher = watch(directory, { persistent: false }, (_event, filename) => {
     if (!filename || filename === "status.json") void inspect();
@@ -50,9 +52,28 @@ export function watchMemoryDreamStatus(
     try {
       do {
         dirty = false;
-        const status = JSON.parse(await readFile(join(directory, "status.json"), "utf8")) as { state?: unknown };
+        const status = JSON.parse(await readFile(join(directory, "status.json"), "utf8")) as {
+          state?: unknown;
+          archivedCount?: unknown;
+          deferredCount?: unknown;
+        };
         if (closed || typeof status.state !== "string" || seen.has(status.state)) continue;
-        const notifications: Record<string, MemoryDreamNotification> = {
+        const mergeCompletedMessage = typeof status.deferredCount === "number" && status.deferredCount > 0
+          ? (typeof status.archivedCount === "number" && status.archivedCount === 0
+            ? "Memory store merge completed; no legacy stores were archived because source store(s) were busy, modified concurrently, or unavailable and were kept for a later pass."
+            : "Memory store merge completed; unchanged legacy store(s) were archived and concurrently modified or busy store(s) were kept for a later pass.")
+          : "Memory store merge completed; consolidated legacy store(s) were archived.";
+        const notifications: Record<string, MemoryDreamNotification> = kind === "merge" ? {
+          running: { state: "running", type: "info", message: "Memory store merge is running." },
+          completed: {
+            state: "completed",
+            type: "info",
+            message: mergeCompletedMessage,
+          },
+          failed: { state: "failed", type: "error", message: "Memory store merge failed; legacy stores were kept intact and completed writes are retained." },
+          timed_out: { state: "timed_out", type: "warning", message: "Memory store merge timed out; cleanup is being enforced. Legacy stores were kept intact and completed writes are retained." },
+          not_claimed: { state: "not_claimed", type: "info", message: "Memory store merge skipped: no merge work was claimed (work may already be claimed or consolidated)." },
+        } : {
           running: { state: "running", type: "info", message: "Memory dreaming is running." },
           completed: { state: "completed", type: "info", message: "Memory dreaming completed; its claimed batch was acknowledged." },
           failed: { state: "failed", type: "error", message: "Memory dreaming failed; pending work and completed writes are retained." },

@@ -38,10 +38,14 @@ npm pack --dry-run
 | `src/memory-extension.ts` | Markdown 工具、命令、开关、context 注入和后台调度 |
 | `src/memory-history.ts` | 前台会话历史工具的参数、项目信任检查及来源提供器配置 |
 | `src/memory-schema.ts` | Markdown 写入工具参数与作用域类型 |
-| `src/memory-store.ts` | 项目定位、活动文件读写、哈希冲突、历史、锁与原子替换 |
+| `src/memory-project.ts` | Git worktree/子模块解析、`origin` URL 与 SSH 别名归一化、可读目录名、本机 identity 映射与同仓库旧库发现 |
+| `src/memory-store.ts` | 存储句柄、确定性只读回退、写时目录升格、旧库归档原语、活动文件读写、哈希冲突、历史、锁与原子替换 |
 | `src/memory-search.ts` | 词法检索、文件列表和紧凑索引上下文 |
-| `src/memory-dream.ts` | 独立 supervisor 启动、期限执行和私有运行记录 |
-| `src/memory-dream-worker.ts` | 普通 Agent 维护提示与 worker 自主完成确认 |
+| `src/memory-worker-launch.ts` | 共享独立 POSIX supervisor、期限执行、后代清理与 worker 启动 |
+| `src/memory-dream.ts` | 独立 dreaming 启动检查与私有运行记录 |
+| `src/memory-dream-worker.ts` | 普通 Agent dreaming 维护提示与 worker 自主完成确认 |
+| `src/memory-merge.ts` | 机制触发的同仓库旧库合并协调、零模型快路径、租约退避与指纹校验归档 |
+| `src/memory-merge-worker.ts` | 专属项目级旧库合并 worker 扩展与完成收尾 |
 | `src/memory-sources.ts` | 供前台历史工具使用的只读原生会话提供器，dreaming 不使用 |
 | `src/memory-schedule.ts` | 实际用户消息 ID 持久去重、会话批次、legacy 迁移、租约与代次确认 |
 | `src/memory-observations.ts` | 用户消息观察的有序提交、锁释放事件唤醒与失败保留 |
@@ -54,7 +58,8 @@ npm pack --dry-run
 
 | 层面 | 主要断言 |
 | --- | --- |
-| 存储 | 项目与全局隔离、路径和 identity 校验、明文 Markdown、哈希冲突、历史保留与容量、锁、取消和原子替换 |
+| 存储 | 项目与全局隔离、Git worktree/bare 仓库/子模块 identity 解析、`origin` URL 与 `~/.ssh/config` 别名归一化、可读目录名、本机映射、确定性只读回退与双锁写时迁移、同仓库旧库发现、活跃租约/锁/损坏 fail-closed、路径和 identity 校验、明文 Markdown、哈希冲突、历史保留与容量、锁、取消和原子替换 |
+| 同仓库旧库合并 | 区别于 dreaming 的机制触发合并：单旧克隆零模型升格与空旧库归档并折入 v2 调度、专属项目级合并 worker 拒绝全局作用域、与项目 dreaming 互斥、按内容指纹失效的退避、校验指纹后原子归档至 `.merged-legacy/` 并写 `.merge-manifest.json`，以及 `--pi-memory-no-dream` 提示不启动 |
 | 检索与索引 | 英文词、汉字和日文假名双字检索、无 query 列表、只注入 MEMORY.md、不自动注入命中正文、预算与临时性 |
 | 前台 Markdown 接口 | 三个工具 schema、默认值、轻量用途与自主选择提示、无固定正文模板，保留工具操作说明；行范围内 Unicode 码点分页与 8 KiB 页上限、长单行读取、完整 JSON 输出、全局自主写入、项目信任和仅元数据写入回执；唯一 `/memory` 命令的空参数用法、原话转交与忙时 follow-up，无旧命令别名或管理子命令 |
 | 后台调度 | 启动时建立已有用户 ID 基线，settled 只观察新增实际用户消息；跨会话持久按 ID 去重，累计 50 条待处理消息领取，不依赖已有笔记；会话 ID 与文件提示；v1 待处理轮数迁移为一次性 legacy 工作，不计作实际用户；开关独立、无手动入口、只读启动不建库 |

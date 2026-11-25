@@ -34,6 +34,7 @@ interface MemoryObservationProject {
   handle: MemoryStoreHandle;
   pending: PendingMemoryObservation[];
   pendingKeys: Set<string>;
+  watchedLockNames: Set<string>;
   watcher?: FSWatcher;
   flushPromise?: Promise<void>;
   wakeRequested: boolean;
@@ -65,14 +66,14 @@ export function createMemoryObservationQueue(
     void flushProject(project).catch((error) => reportError(project.handle, error));
   }
 
-  function ensureProjectWatcher(project: MemoryObservationProject): void {
+  function ensureProjectWatcher(project: MemoryObservationProject, lockPath?: string): void {
+    if (lockPath) project.watchedLockNames.add(basename(lockPath));
     if (project.watcher || closed || !project.pending.length) return;
-    const lockName = `${basename(project.handle.directory)}.lock`;
     let watcher: FSWatcher;
     try {
       watcher = watchImplementation(dirname(project.handle.directory), { persistent: false }, (_eventType, filename) => {
         if (project.watcher !== watcher || closed) return;
-        if (filename === null || filename.toString() === lockName) {
+        if (filename === null || project.watchedLockNames.has(filename.toString())) {
           project.wakeRequested = true;
           requestProjectFlush(project);
         }
@@ -103,7 +104,7 @@ export function createMemoryObservationQueue(
         try {
           snapshot = await recordMemoryTurn(observation.handle, observation.turn);
         } catch (error) {
-          if (isMemoryStoreLockedError(error)) ensureProjectWatcher(project);
+          if (isMemoryStoreLockedError(error)) ensureProjectWatcher(project, error.lockPath);
           else {
             project.wakeRequested = false;
             closeProjectWatcher(project);
@@ -141,7 +142,10 @@ export function createMemoryObservationQueue(
       const directory = handle.directory;
       let project = projects.get(directory);
       if (!project) {
-        project = { handle, pending: [], pendingKeys: new Set<string>(), wakeRequested: false };
+        project = {
+          handle, pending: [], pendingKeys: new Set<string>(),
+          watchedLockNames: new Set([`${basename(handle.directory)}.lock`]), wakeRequested: false,
+        };
         projects.set(directory, project);
       }
       const key = JSON.stringify([directory, turn.sessionId, turn.entryId]);

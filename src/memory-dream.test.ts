@@ -9,7 +9,7 @@ import { createMemoryTestDirectory } from "../test/memory-fixtures.ts";
 import { runMemoryDream, MEMORY_DREAM_TIMEOUT_MS, type MemoryDreamOptions } from "./memory-dream.ts";
 import { buildGlobalMemoryDreamPrompt, buildMemoryDreamPrompt } from "./memory-dream-worker.ts";
 import { claimMemoryDream, readMemorySchedule, recordMemoryTurn } from "./memory-schedule.ts";
-import { createMemoryStoreHandle, readMemoryNote, writeMemoryNote } from "./memory-store.ts";
+import { createMemoryStoreHandle, readMemoryNote, resolveMemoryProjectHandle, writeMemoryNote } from "./memory-store.ts";
 import { recordMemoryNoteRead } from "./memory-access.ts";
 
 const packageRoot = fileURLToPath(new URL("../", import.meta.url));
@@ -292,4 +292,57 @@ test("an active project dream lease suppresses extra supervisors before creating
   assert.ok(await claimMemoryDream(h.options.handle, { ownerId: "existing-project-worker" }));
   assert.equal(await runMemoryDream(h.options), "");
   assert.ok(!(await readdir(h.options.handle.directory)).includes(".dream-runs"));
+});
+
+test("real isolated Pi dream runs from a linked worktree using remote project identity and workerCwd", { timeout: 25000 }, async (ctx) => {
+  const directory = await createMemoryTestDirectory(ctx);
+  const mainRepo = join(directory, "main-repo");
+  const worktree = join(directory, "wt-branch");
+  const adminDir = join(mainRepo, ".git", "worktrees", "wt-branch");
+  await mkdir(adminDir, { recursive: true });
+  await mkdir(worktree, { recursive: true });
+  await writeFile(join(mainRepo, ".git", "config"), '[remote "origin"]\n\turl = git@github.com:ExampleOrg/SharedRepo.git\n');
+  await writeFile(join(worktree, ".git"), `gitdir: ${adminDir}\n`);
+  await writeFile(join(adminDir, "commondir"), "../..\n");
+  await writeFile(join(adminDir, "gitdir"), `${join(worktree, ".git")}\n`);
+
+  const root = join(directory, "memory");
+  const { handle, project } = await resolveMemoryProjectHandle(root, worktree, { sshConfigPath: "" });
+  assert.equal(project.identity, "git:github.com/exampleorg/sharedrepo");
+  assert.equal(project.worktreeRoot, worktree);
+
+  const source = join(directory, "source.jsonl");
+  await writeFile(source, JSON.stringify({ type: "session", version: 3, id: "synthetic-source-session", cwd: worktree }) + "\n" +
+    JSON.stringify({ id: "user-0", type: "message", message: { role: "user", content: "SYNTHETIC_VERIFIED_FEEDBACK" } }) + "\n");
+  for (let index = 0; index < 50; index++) {
+    await recordMemoryTurn(handle, { sessionId: "synthetic-source-session", entryId: `user-${index}`, sessionFile: source });
+  }
+  const trace = join(directory, "trace.jsonl");
+  testEnvironment(ctx, {
+    PI_OFFLINE: "1", PI_SKIP_VERSION_CHECK: "1", PI_TELEMETRY: "0", JITI_FS_CACHE: "false",
+    PI_MEMORY_TEST_TRACE: trace, PI_MEMORY_TEST_SOURCE: source,
+  });
+  const options: MemoryDreamOptions = {
+    handle,
+    workerCwd: project.worktreeRoot,
+    model: { provider: "memory-dream-test", id: "scripted" },
+    agentDir: join(directory, "agent"),
+    sessionRoots: [directory],
+    thinkingLevel: "off",
+  };
+  const receipt = await runMemoryDream(options, {
+    cliPath,
+    cliArgs: ["--offline", "--approve", "--no-extensions", "--no-mcp", "--no-skills",
+      "--no-prompt-templates", "--no-context-files", "--no-session", "-e", join(packageRoot, "test/memory-dream-provider.ts")],
+  });
+  cleanupSupervisor(ctx, receipt);
+  const run = await runDirectory(options);
+  const status = await waitForStatus(run, (state) => ["completed", "failed"].includes(String(state.state)));
+  assert.equal(status.state, "completed", JSON.stringify(status) + "\n" + await readFile(join(run, "supervisor.log"), "utf8"));
+  assert.match((await readMemoryNote(handle, "lessons.md"))?.content ?? "", /SYNTHETIC_VERIFIED_FEEDBACK/);
+  // Reading from the main repo checkout hits the exact same shared remote memory store.
+  const mainResolved = await resolveMemoryProjectHandle(root, mainRepo, { sshConfigPath: "" });
+  assert.equal(mainResolved.handle.directory, handle.directory);
+  assert.match((await readMemoryNote(mainResolved.handle, "lessons.md"))?.content ?? "", /SYNTHETIC_VERIFIED_FEEDBACK/);
+  assert.equal((await readMemorySchedule(mainResolved.handle)).pendingTurns, 0);
 });

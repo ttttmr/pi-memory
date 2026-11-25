@@ -72,3 +72,23 @@ test("aborting dream status observation does not change the worker's status", as
   await new Promise((resolve) => setImmediate(resolve));
   assert.deepEqual(notices, []);
 });
+
+test("merge status notifications distinguish all-deferred vs partial-archived completion", async (ctx) => {
+  const allDeferredDir = await createMemoryTestDirectory(ctx);
+  await writeFile(join(allDeferredDir, "status.json"), JSON.stringify({ state: "completed", archivedCount: 0, deferredCount: 2 }));
+  const c1 = new AbortController();
+  ctx.after(() => c1.abort());
+  const allDeferred = await new Promise<MemoryDreamNotification>((resolve) => {
+    watchMemoryDreamStatus(allDeferredDir, Date.now() + 1000, resolve, c1.signal, "merge");
+  });
+  assert.match(allDeferred.message, /no legacy stores were archived/);
+
+  const partialDir = await createMemoryTestDirectory(ctx);
+  await writeFile(join(partialDir, "status.json"), JSON.stringify({ state: "completed", archivedCount: 1, deferredCount: 1 }));
+  const c2 = new AbortController();
+  ctx.after(() => c2.abort());
+  const partial = await new Promise<MemoryDreamNotification>((resolve) => {
+    watchMemoryDreamStatus(partialDir, Date.now() + 1000, resolve, c2.signal, "merge");
+  });
+  assert.match(partial.message, /unchanged legacy store\(s\) were archived/);
+});

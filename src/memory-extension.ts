@@ -6,8 +6,9 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { memoryWriteSchema as writeSchema, type MemoryScope } from "./memory-schema.ts";
 import {
-  archiveMemoryNote, createMemoryStoreHandle, listMemoryNotes, readMemoryNote,
-  resolveMemoryProject, writeMemoryNote, type MemoryStoreHandle,
+  archiveMemoryNote, createMemoryStoreHandle, defaultLocalMemoryMapPath, listMemoryNotes,
+  readMemoryNote, resolveMemoryProjectHandle, writeMemoryNote,
+  type MemoryProjectResolution, type MemoryStoreHandle,
 } from "./memory-store.ts";
 import { buildMemoryRecall, searchMemoryNotes } from "./memory-search.ts";
 import { recordMemoryNoteRead } from "./memory-access.ts";
@@ -16,6 +17,8 @@ import { registerMemoryHistoryTools } from "./memory-history.ts";
 import { memoryToolResult } from "./memory-tool-result.ts";
 import type { MemoryDreamNotification } from "./memory-dream-notifications.ts";
 import { runMemoryDream, type MemoryDreamOptions } from "./memory-dream.ts";
+import { isMemoryMergeDue, prepareMemoryMerge, runMemoryMerge, type MemoryMergeOptions } from "./memory-merge.ts";
+import type { MemoryWorkerLaunchDependencies } from "./memory-worker-launch.ts";
 import {
   createMemoryObservationQueue, type MemoryObservationQueue, type MemoryObservationQueueOptions,
 } from "./memory-observations.ts";
@@ -26,7 +29,11 @@ interface MemoryObservationRuntime {
   callbacks: MemoryObservationQueueOptions;
   launch?: Promise<void>;
   globalLaunch?: Promise<void>;
+  mergeLaunch?: Promise<void>;
   nextGlobalDreamCheckAt?: number;
+  lastMergeCheckedDir?: string;
+  nextMergeCheckAt?: number;
+  lastNoDreamMergeNotice?: string;
   statusControllers?: Set<AbortController>;
   pendingNotifications?: MemoryDreamNotification[];
   notify?: (notification: MemoryDreamNotification) => void;
@@ -41,6 +48,7 @@ interface MemoryToolAccess {
 
 const RECALL_MESSAGE_TYPE = "pi-memory-recall";
 const GLOBAL_DREAM_CHECK_INTERVAL_MS = 10 * 60 * 1000;
+const MERGE_CHECK_INTERVAL_MS = 10 * 60 * 1000;
 const scopeSchema = Type.Optional(Type.Enum(["project", "global"]));
 const searchSchema = Type.Object({
   query: Type.Optional(Type.String({ maxLength: 1000 })),
@@ -54,15 +62,18 @@ const readSchema = Type.Object({
   startCharacter: Type.Optional(Type.Integer({ minimum: 0 })),
 });
 
-/** Markdown memory is model-maintained; dreaming runs in a detached full Pi Agent. */
+/** Markdown memory is model-maintained; dreaming and store merging run in detached full Pi Agents. */
 export default function piMemoryExtension(
   pi: ExtensionAPI,
   dreamRunner: typeof runMemoryDream = runMemoryDream,
   observationQueueFactory: typeof createMemoryObservationQueue = createMemoryObservationQueue,
+  mergeRunner: typeof runMemoryMerge = runMemoryMerge,
 ): void {
   let recallEnabled = true;
   let dreamEnabled = true;
   const isDreamWorker = process.env.PI_MEMORY_DREAM_WORKER === "1";
+  const isMergeWorker = process.env.PI_MEMORY_MERGE_WORKER === "1";
+  const isBackgroundWorker = isDreamWorker || isMergeWorker;
   const isGlobalDreamWorker = isDreamWorker && process.env.PI_MEMORY_DREAM_SCOPE === "global";
   const observedUserEntries = new Set<string>();
   let lastRecallError = "";
@@ -70,12 +81,21 @@ export default function piMemoryExtension(
   let latestObservation: { handle: MemoryStoreHandle; sessionId: string; entryId: string; launch: MemoryDreamOptions } | undefined;
   let sessionGeneration = 0;
 
+  const resolveProjectFor = async (ctx: ExtensionContext) => {
+    if (isGlobalDreamWorker) throw new Error("Global memory dreaming cannot access project memory");
+    if (!ctx.isProjectTrusted()) throw new Error("Memory project access requires Pi project trust");
+    const agentDir = getAgentDir();
+    const root = process.env.PI_MEMORY_DIR || join(agentDir, "pi-memory");
+    return resolveMemoryProjectHandle(root, ctx.cwd, {
+      localMapPath: defaultLocalMemoryMapPath(agentDir),
+      bindLocalMap: !isBackgroundWorker,
+    });
+  };
   const handleFor = async (ctx: ExtensionContext, scope: MemoryScope) => {
-    if (scope === "project" && isGlobalDreamWorker) throw new Error("Global memory dreaming cannot access project memory");
-    if (scope === "project" && !ctx.isProjectTrusted()) throw new Error("Memory project access requires Pi project trust");
+    if (scope === "project") return (await resolveProjectFor(ctx)).handle;
+    if (isMergeWorker) throw new Error("Memory store merge cannot access global memory");
     const root = process.env.PI_MEMORY_DIR || join(getAgentDir(), "pi-memory");
-    const project = scope === "project" ? await resolveMemoryProject(ctx.cwd) : "global";
-    return createMemoryStoreHandle(root, project, scope);
+    return createMemoryStoreHandle(root, "global", "global");
   };
   const accessFor = (ctx: ExtensionContext): MemoryToolAccess => ({
     handleFor: (scope) => handleFor(ctx, scope), sessionId: ctx.sessionManager.getSessionId(),
@@ -83,7 +103,7 @@ export default function piMemoryExtension(
   const searchNotes = async (params: Static<typeof searchSchema>, signal: AbortSignal | undefined, access: MemoryToolAccess) => {
     signal?.throwIfAborted();
     const scopes: MemoryScope[] = !params.scope || params.scope === "all" ?
-      (isGlobalDreamWorker ? ["global"] : ["project", "global"]) : [params.scope];
+      (isGlobalDreamWorker ? ["global"] : isMergeWorker ? ["project"] : ["project", "global"]) : [params.scope];
     const notes = (await Promise.all(scopes.map(async (scope) =>
       (await listMemoryNotes(await access.handleFor(scope))).map((document) => ({ scope, document }))))).flat();
     const hits = searchMemoryNotes(notes, params.query, params.limit);
@@ -94,9 +114,9 @@ export default function piMemoryExtension(
     const handle = await access.handleFor(params.scope ?? "project");
     const document = await readMemoryNote(handle, params.path ?? "MEMORY.md");
     if (!document) return memoryToolResult({ path: params.path ?? "MEMORY.md", exists: false, hash: null });
-    // Count the first page of a foreground read as one access; continuation pages and dreaming reads do not count.
+    // Count the first page of a foreground read as one access; continuation pages and background worker reads do not count.
     // Statistics are advisory, so their failures never fail the read.
-    if (!isDreamWorker && (params.offset ?? 1) === 1 && !params.startCharacter) {
+    if (!isBackgroundWorker && (params.offset ?? 1) === 1 && !params.startCharacter) {
       await recordMemoryNoteRead(handle, document.path).catch(() => false);
     }
     const lines = document.content.split("\n");
@@ -163,8 +183,12 @@ export default function piMemoryExtension(
   pi.registerTool(readTool);
   pi.registerTool(writeTool);
 
-  // Project and global passes use separate launch slots; observation never owns or waits for a worker's lifecycle.
-  function startDetachedDream(options: MemoryDreamOptions, slot: "launch" | "globalLaunch"): void {
+  // Project dreaming, global dreaming, and store-merge passes use separate launch slots; observation never owns a worker's lifecycle.
+  function startDetachedBackgroundRun(
+    runner: (deps: MemoryWorkerLaunchDependencies) => Promise<string>,
+    slot: "launch" | "globalLaunch" | "mergeLaunch",
+    failureLabel: string,
+  ): void {
     const controller = new AbortController();
     (observationRuntime.statusControllers ??= new Set()).add(controller);
     let launchDelivered = false;
@@ -172,7 +196,7 @@ export default function piMemoryExtension(
     const deliverStatus = (notification: MemoryDreamNotification) => {
       if (!controller.signal.aborted) observationRuntime.notify?.(notification);
     };
-    const launch = dreamRunner(options, {
+    const launch = runner({
       statusSignal: controller.signal,
       onStatus(notification) {
         if (notification.state !== "running") observationRuntime.statusControllers?.delete(controller);
@@ -193,7 +217,7 @@ export default function piMemoryExtension(
     }, (error: unknown) => {
       controller.abort();
       observationRuntime.statusControllers?.delete(controller);
-      const message = `Memory dreaming launch failed: ${error instanceof Error ? error.message : String(error)}`;
+      const message = `${failureLabel} launch failed: ${error instanceof Error ? error.message : String(error)}`;
       if (observationContext) showMemoryCommand(observationContext, message, "warning");
       else console.error(message);
     });
@@ -202,11 +226,18 @@ export default function piMemoryExtension(
       if (observationRuntime[slot] === launch) observationRuntime[slot] = undefined;
     });
   }
+  function startDetachedDream(options: MemoryDreamOptions, slot: "launch" | "globalLaunch"): void {
+    startDetachedBackgroundRun((deps) => dreamRunner(options, deps), slot, "Memory dreaming");
+  }
+  function startDetachedMerge(options: MemoryMergeOptions): void {
+    startDetachedBackgroundRun((deps) => mergeRunner(options, deps), "mergeLaunch", "Memory store merge");
+  }
   const observationCallbacks: MemoryObservationQueueOptions = {
     onRecorded(handle, turn, snapshot) {
       const current = latestObservation;
       if (!current || current.handle.directory !== handle.directory || current.sessionId !== turn.sessionId ||
-          current.entryId !== turn.entryId || !dreamEnabled || isDreamWorker || !snapshot.due || observationRuntime.launch) return;
+          current.entryId !== turn.entryId || !dreamEnabled || isBackgroundWorker || !snapshot.due ||
+          observationRuntime.launch || observationRuntime.mergeLaunch) return;
       startDetachedDream(current.launch, "launch");
     },
     onError(_handle, error) {
@@ -239,7 +270,7 @@ export default function piMemoryExtension(
   pi.registerFlag("pi-memory-no-history", { description: "Disable Pi session history search and read tools", type: "boolean", default: false });
   pi.on("session_start", async (_event, ctx) => {
     // CLI flag values are available after extension loading, before the first request.
-    if (!isDreamWorker && !pi.getFlag("pi-memory-no-history")) registerMemoryHistoryTools(pi);
+    if (!isBackgroundWorker && !pi.getFlag("pi-memory-no-history")) registerMemoryHistoryTools(pi);
     observationContext = ctx;
     for (const notification of observationRuntime.pendingNotifications?.splice(0) ?? []) observationRuntime.notify?.(notification);
     resetObservationContext();
@@ -251,7 +282,7 @@ export default function piMemoryExtension(
     recallEnabled = !pi.getFlag("pi-memory-no-recall");
     dreamEnabled = !pi.getFlag("pi-memory-no-dream");
     lastRecallError = "";
-    if (!isDreamWorker) await observations.flush();
+    if (!isBackgroundWorker) await observations.flush();
   });
   pi.on("session_shutdown", async (event, ctx) => {
     if (observationRuntime.callbacks !== observationCallbacks) return;
@@ -260,9 +291,10 @@ export default function piMemoryExtension(
     // Do not exit between preparing launch files and spawning the detached process.
     await observationRuntime.launch;
     await observationRuntime.globalLaunch;
+    await observationRuntime.mergeLaunch;
     if (event.reason && event.reason !== "quit") {
       // Replacement reuses pending observations, never the retired host context.
-      if (!isDreamWorker) await observations.flush();
+      if (!isBackgroundWorker) await observations.flush();
       observationContext = undefined;
       return;
     }
@@ -280,7 +312,7 @@ export default function piMemoryExtension(
   pi.on("session_before_fork", resetObservationContext);
   pi.on("session_before_switch", resetObservationContext);
   pi.on("agent_settled", async (_event, ctx) => {
-    if (isDreamWorker || !ctx.isProjectTrusted()) return;
+    if (isBackgroundWorker || !ctx.isProjectTrusted()) return;
     const entries = ctx.sessionManager.getBranch().filter((entry) =>
       entry.type === "message" && entry.message.role === "user" && !observedUserEntries.has(entry.id));
     if (!entries.length) return;
@@ -288,25 +320,97 @@ export default function piMemoryExtension(
     const sessionFile = ctx.sessionManager.getSessionFile();
     const generation = sessionGeneration;
     observationContext = ctx;
+    let resolvedProject: { handle: MemoryStoreHandle; project: MemoryProjectResolution } | undefined;
     try {
-      const handle = await handleFor(ctx, "project");
-      if (generation !== sessionGeneration || observationRuntime.callbacks !== observationCallbacks) return;
-      const customRoot = ctx.sessionManager.getSessionDir();
-      if (ctx.model) latestObservation = {
-        handle, sessionId, entryId: entries.at(-1)!.id,
-        launch: { handle, agentDir: getAgentDir(), model: { provider: ctx.model.provider, id: ctx.model.id },
-          thinkingLevel: pi.getThinkingLevel(),
-          sessionRoots: [join(getAgentDir(), "sessions"), ...(customRoot ? [customRoot] : [])] },
-      };
-      for (const entry of entries) {
-        observedUserEntries.add(entry.id);
-        await observations.enqueue(handle, { sessionId, entryId: entry.id, ...(sessionFile ? { sessionFile } : {}) });
-      }
+      resolvedProject = await resolveProjectFor(ctx);
     } catch (error) {
       showMemoryCommand(ctx, `Memory dreaming schedule unavailable: ${error instanceof Error ? error.message : String(error)}`, "warning");
     }
+    if (resolvedProject) {
+      if (generation !== sessionGeneration || observationRuntime.callbacks !== observationCallbacks) return;
+      const { handle, project } = resolvedProject;
+      // Run zero-LLM store promotion / merge discovery before enqueueing turn observations so
+      // a sole sibling clone can be promoted atomically instead of creating an empty primary store first.
+      await maybeStartMemoryMerge(ctx, generation, project, handle);
+      if (generation !== sessionGeneration || observationRuntime.callbacks !== observationCallbacks) return;
+      try {
+        const customRoot = ctx.sessionManager.getSessionDir();
+        if (ctx.model) latestObservation = {
+          handle, sessionId, entryId: entries.at(-1)!.id,
+          launch: { handle, agentDir: getAgentDir(), model: { provider: ctx.model.provider, id: ctx.model.id },
+            thinkingLevel: pi.getThinkingLevel(), workerCwd: project.worktreeRoot,
+            sessionRoots: [join(getAgentDir(), "sessions"), ...(customRoot ? [customRoot] : [])] },
+        };
+        for (const entry of entries) {
+          observedUserEntries.add(entry.id);
+          await observations.enqueue(handle, { sessionId, entryId: entry.id, ...(sessionFile ? { sessionFile } : {}) });
+        }
+      } catch (error) {
+        showMemoryCommand(ctx, `Memory dreaming schedule unavailable: ${error instanceof Error ? error.message : String(error)}`, "warning");
+      }
+    }
     await maybeStartGlobalDream(ctx, generation);
   });
+  // Mechanism-triggered store consolidation: discovers sibling/legacy worktree or clone stores for the same
+  // repository, handles zero-LLM promotion/empty-archival immediately, and launches a dedicated merge worker
+  // when multiple note-bearing stores need semantic consolidation.
+  const maybeStartMemoryMerge = async (
+    ctx: ExtensionContext,
+    generation: number,
+    project: MemoryProjectResolution,
+    handle: MemoryStoreHandle,
+  ) => {
+    const now = Date.now();
+    if (observationRuntime.mergeLaunch || observationRuntime.launch ||
+        generation !== sessionGeneration || observationRuntime.callbacks !== observationCallbacks ||
+        (observationRuntime.lastMergeCheckedDir === handle.directory && (observationRuntime.nextMergeCheckAt ?? 0) > now)) {
+      return;
+    }
+    try {
+      const agentDir = getAgentDir();
+      const root = process.env.PI_MEMORY_DIR || join(agentDir, "pi-memory");
+      const prepared = await prepareMemoryMerge(root, project, handle, {
+        localMapPath: defaultLocalMemoryMapPath(agentDir),
+      });
+      if (generation !== sessionGeneration || observationRuntime.callbacks !== observationCallbacks) return;
+      if (prepared.kind === "deferred") return;
+      if (prepared.kind === "needs_merge") {
+        if (!dreamEnabled) {
+          observationRuntime.lastMergeCheckedDir = handle.directory;
+          observationRuntime.nextMergeCheckAt = Date.now() + MERGE_CHECK_INTERVAL_MS;
+          const noticeKey = `${handle.directory}:${prepared.fingerprint}`;
+          if (observationRuntime.lastNoDreamMergeNotice !== noticeKey) {
+            observationRuntime.lastNoDreamMergeNotice = noticeKey;
+            showMemoryCommand(
+              ctx,
+              `Found ${prepared.sources.length} unmerged legacy/sibling memory store(s) for this repository, but automatic background merging is disabled (--pi-memory-no-dream). Primary memory remains usable.`,
+              "warning",
+            );
+          }
+          return;
+        }
+        if (!ctx.model) return;
+        const due = await isMemoryMergeDue(handle, prepared.sources);
+        if (generation !== sessionGeneration || observationRuntime.callbacks !== observationCallbacks) return;
+        observationRuntime.lastMergeCheckedDir = handle.directory;
+        observationRuntime.nextMergeCheckAt = Date.now() + MERGE_CHECK_INTERVAL_MS;
+        if (!due) return;
+        startDetachedMerge({
+          handle,
+          agentDir,
+          model: { provider: ctx.model.provider, id: ctx.model.id },
+          thinkingLevel: pi.getThinkingLevel(),
+          workerCwd: project.worktreeRoot,
+          sources: prepared.sources,
+        });
+        return;
+      }
+      observationRuntime.lastMergeCheckedDir = handle.directory;
+      observationRuntime.nextMergeCheckAt = Date.now() + MERGE_CHECK_INTERVAL_MS;
+    } catch (error) {
+      showMemoryCommand(ctx, `Memory store merge check unavailable: ${error instanceof Error ? error.message : String(error)}`, "warning");
+    }
+  };
   // A low-frequency global pass consolidates and prunes global memory, which project passes may only add to or correct.
   // Checks are throttled per process; the shared global state applies cross-process backoff and the lease.
   const maybeStartGlobalDream = async (ctx: ExtensionContext, generation: number) => {
@@ -333,7 +437,7 @@ export default function piMemoryExtension(
     const userIndex = messages.findLastIndex((message) => message.role === "user");
     if (userIndex < 0) return { messages };
     try {
-      const scopes: readonly MemoryScope[] = isGlobalDreamWorker ? ["global"] : ["project", "global"];
+      const scopes: readonly MemoryScope[] = isGlobalDreamWorker ? ["global"] : isMergeWorker ? ["project"] : ["project", "global"];
       const indexes = await Promise.all(scopes.map(async (scope) => ({
         scope, document: await readMemoryNote(await handleFor(ctx, scope), "MEMORY.md"),
       })));
