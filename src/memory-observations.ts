@@ -40,12 +40,21 @@ interface MemoryObservationProject {
   wakeRequested: boolean;
 }
 
+/** Injectable hooks let reloaded runtimes swap storage handlers without replacing the FIFO. */
+export interface MemoryObservationQueueDependencies {
+  watch?: typeof watch;
+  recordTurn?: typeof recordMemoryTurn;
+  isLockedError?: typeof isMemoryStoreLockedError;
+}
+
 /** Queues new user message observations and retries them on lock-release events without polling. */
 export function createMemoryObservationQueue(
   options: MemoryObservationQueueOptions,
-  dependencies: { watch?: typeof watch } = {},
+  dependencies: MemoryObservationQueueDependencies = {},
 ): MemoryObservationQueue {
   const watchImplementation = dependencies.watch ?? watch;
+  const recordTurnImplementation = dependencies.recordTurn ?? recordMemoryTurn;
+  const isLockedErrorImplementation = dependencies.isLockedError ?? isMemoryStoreLockedError;
   const projects = new Map<string, MemoryObservationProject>();
   let closed = false;
   let closePromise: Promise<number> | undefined;
@@ -102,9 +111,9 @@ export function createMemoryObservationQueue(
         const observation = project.pending[0]!;
         let snapshot: MemoryScheduleSnapshot;
         try {
-          snapshot = await recordMemoryTurn(observation.handle, observation.turn);
+          snapshot = await recordTurnImplementation(observation.handle, observation.turn);
         } catch (error) {
-          if (isMemoryStoreLockedError(error)) ensureProjectWatcher(project, error.lockPath);
+          if (isLockedErrorImplementation(error)) ensureProjectWatcher(project, error.lockPath);
           else {
             project.wakeRequested = false;
             closeProjectWatcher(project);

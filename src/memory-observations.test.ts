@@ -8,7 +8,7 @@ import test from "node:test";
 import { createMemoryTestDirectory } from "../test/memory-fixtures.ts";
 import { createMemoryObservationQueue, type MemoryObservationTurn } from "./memory-observations.ts";
 import { readMemorySchedule, recordMemoryTurn } from "./memory-schedule.ts";
-import { createMemoryStoreHandle, type MemoryStoreHandle } from "./memory-store.ts";
+import { createMemoryStoreHandle, type MemoryStoreHandle, type MemoryStoreLockedError } from "./memory-store.ts";
 
 function deferred() {
   let resolve!: () => void;
@@ -301,4 +301,41 @@ test("real competing processes eventually record every queued turn without dupli
   assert.equal(snapshot.observedTurns, 4);
   assert.equal(snapshot.pendingTurns, 4);
   assert.equal(seen.size, 4);
+});
+
+test("injectable recordTurn and isLockedError delegates let a shared FIFO switch storage implementations", async (ctx) => {
+  class SyntheticLockError extends Error {
+    readonly lockPath: string;
+    constructor(lockPath: string) {
+      super(`Locked: ${lockPath}`);
+      this.lockPath = lockPath;
+    }
+  }
+  const root = await createMemoryTestDirectory(ctx);
+  const handle = createMemoryStoreHandle(root, "/delegate-project", "project");
+  const watched = new EventEmitter();
+  const watchImplementation = (() => Object.assign(watched, { close() {} }) as FSWatcher) as unknown as typeof import("node:fs").watch;
+  let generation = 1;
+  let recordedCount = 0;
+  const queue = createMemoryObservationQueue({
+    onRecorded() { recordedCount++; },
+    onError(_handle, error) { assert.fail(`Unexpected error: ${String(error)}`); },
+  }, {
+    watch: watchImplementation,
+    recordTurn: async () => {
+      if (generation === 1) throw new SyntheticLockError(`${handle.directory}.lock`);
+      return { observedTurns: 1, processedTurns: 0, pendingTurns: 1, due: false };
+    },
+    isLockedError: (error): error is MemoryStoreLockedError => error instanceof SyntheticLockError,
+  });
+
+  await queue.enqueue(handle, { sessionId: "session-a", entryId: "entry-1" });
+  assert.equal(queue.pendingCount, 1);
+  assert.equal(recordedCount, 0);
+
+  generation = 2;
+  await queue.flush();
+  assert.equal(queue.pendingCount, 0);
+  assert.equal(recordedCount, 1);
+  assert.equal(await queue.close(), 0);
 });

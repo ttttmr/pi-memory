@@ -652,3 +652,65 @@ test("automatic dreaming startup flag still persists pending experiences for lat
   assert.equal(runs, 1);
   assert.equal((await readMemorySchedule(h.handle)).pendingTurns, 51);
 });
+
+test("reloading after an upgrade retires a pre-versioned legacy observation queue instead of rejecting new handles", async (testCtx) => {
+  const runtimeKey = Symbol.for("pi-memory.observation-runtime");
+  const registry = globalThis as typeof globalThis & { [key: symbol]: Record<string, unknown> | undefined };
+  testCtx.after(() => { delete registry[runtimeKey]; });
+
+  let legacyClosed = 0;
+  let staleCallbackCalled = false;
+  const legacyQueue: MemoryObservationQueue = {
+    get pendingCount() { return 2; },
+    async enqueue() { throw new Error("Memory store handle is invalid"); },
+    async flush() { throw new Error("Memory store handle is invalid"); },
+    async close() {
+      legacyClosed++;
+      (legacyRuntime.callbacks as { onError: (h: unknown, e: unknown) => void }).onError(null, new Error("Memory store handle is invalid"));
+      return 2;
+    },
+  };
+  const legacyRuntime: Record<string, unknown> = {
+    queue: legacyQueue,
+    callbacks: {
+      onRecorded() { staleCallbackCalled = true; },
+      onError() { staleCallbackCalled = true; },
+    },
+  };
+  registry[runtimeKey] = legacyRuntime;
+
+  const h = await createExtensionHarness(testCtx);
+  await h.event("agent_settled");
+  assert.equal(legacyClosed, 1, "The pre-upgrade legacy queue is closed once on reload");
+  assert.equal(staleCallbackCalled, false, "Retired legacy callbacks are detached before closing");
+  assert.equal((await readMemorySchedule(h.handle)).observedTurns, 1, "New observations commit through the fresh v2 queue");
+  assert.equal(h.notices.some((notice) => notice.includes("Memory store handle is invalid")), false);
+  assert.equal(h.notices.some((notice) => notice.includes("retired a pre-upgrade observation queue with 2 unsaved")), true);
+});
+
+test("reloading between v2 runtimes preserves the FIFO while updating storage delegates", async (testCtx) => {
+  const runtimeKey = Symbol.for("pi-memory.observation-runtime");
+  const registry = globalThis as typeof globalThis & { [key: symbol]: Record<string, unknown> | undefined };
+  const h = await createExtensionHarness(testCtx);
+  await h.event("agent_settled");
+  const firstRuntime = registry[runtimeKey]!;
+  const firstQueue = firstRuntime.queue;
+  const lock = `${h.handle.directory}.lock`;
+  await mkdir(lock);
+  await h.event("agent_settled");
+  await h.event("session_shutdown", false, { reason: "reload" });
+
+  // Simulate an older module's storage delegate stored in the v2 runtime before reload.
+  const staleRecordTurn = async () => { throw new Error("Stale recordTurn must not be called after reload"); };
+  firstRuntime.recordTurn = staleRecordTurn;
+
+  const reloaded = await import(new URL("./memory-extension.ts?v2-delegate-reload", import.meta.url).href);
+  const replacement = await createExtensionHarness(testCtx, undefined, [], h, undefined, reloaded.default);
+  assert.equal(registry[runtimeKey], firstRuntime, "v2 reload reuses the shared runtime");
+  assert.equal(firstRuntime.queue, firstQueue, "v2 reload preserves the same FIFO instance");
+  assert.notEqual(firstRuntime.recordTurn, staleRecordTurn, "v2 reload replaces the storage delegate with the reloaded module");
+
+  await rmdir(lock);
+  await replacement.event("session_start");
+  assert.equal((await readMemorySchedule(h.handle)).observedTurns, 2);
+});

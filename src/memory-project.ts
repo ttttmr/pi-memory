@@ -185,7 +185,8 @@ export async function resolveMemoryLegacyCandidates(
   const candidates: MemoryLegacyCandidate[] = [];
   const seen = new Set<string>([primaryDirectory]);
   const add = (identity: string, directoryName: string) => {
-    if (!identity || !directoryName || directoryName.includes("/") || directoryName.includes("\\") || directoryName === "global") {
+    if (!identity || identity.length > 4096 || Buffer.from(identity).toString("utf8") !== identity ||
+        !directoryName || directoryName.includes("/") || directoryName.includes("\\") || directoryName === "global") {
       return;
     }
     const directory = join(resolvedRoot, directoryName);

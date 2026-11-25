@@ -6,10 +6,11 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { memoryWriteSchema as writeSchema, type MemoryScope } from "./memory-schema.ts";
 import {
-  archiveMemoryNote, createMemoryStoreHandle, defaultLocalMemoryMapPath, listMemoryNotes,
-  readMemoryNote, resolveMemoryProjectHandle, writeMemoryNote,
-  type MemoryProjectResolution, type MemoryStoreHandle,
+  archiveMemoryNote, createMemoryStoreHandle, defaultLocalMemoryMapPath, isMemoryStoreLockedError,
+  listMemoryNotes, readMemoryNote, resolveMemoryProjectHandle, writeMemoryNote,
+  type MemoryProjectResolution, type MemoryStoreHandle, type MemoryStoreLockedError,
 } from "./memory-store.ts";
+import { recordMemoryTurn } from "./memory-schedule.ts";
 import { buildMemoryRecall, searchMemoryNotes } from "./memory-search.ts";
 import { recordMemoryNoteRead } from "./memory-access.ts";
 import { isGlobalMemoryDreamDue } from "./memory-global-schedule.ts";
@@ -23,10 +24,17 @@ import {
   createMemoryObservationQueue, type MemoryObservationQueue, type MemoryObservationQueueOptions,
 } from "./memory-observations.ts";
 
-// Pi reloads modules without changing the session: keep one FIFO, but replace its runtime callbacks.
+const OBSERVATION_QUEUE_VERSION = 2;
+
+// Pi reloads modules without changing the session: keep one FIFO, but replace its runtime callbacks
+// and storage delegates so upgraded code never executes through a stale module closure.
 interface MemoryObservationRuntime {
   queue?: MemoryObservationQueue;
+  queueVersion?: number;
   callbacks: MemoryObservationQueueOptions;
+  recordTurn?: typeof recordMemoryTurn;
+  isLockedError?: typeof isMemoryStoreLockedError;
+  retiringQueueClose?: Promise<void>;
   launch?: Promise<void>;
   globalLaunch?: Promise<void>;
   mergeLaunch?: Promise<void>;
@@ -246,8 +254,43 @@ export default function piMemoryExtension(
       else console.error(message);
     },
   };
-  const observationRuntime = observationRuntimeRegistry[observationRuntimeKey] ??= { callbacks: observationCallbacks };
-  observationRuntime.callbacks = observationCallbacks;
+  const existingRuntime = observationRuntimeRegistry[observationRuntimeKey];
+  let retiredLegacyQueue: MemoryObservationQueue | undefined;
+  let observationRuntime: MemoryObservationRuntime;
+  if (existingRuntime?.queue && existingRuntime.queueVersion !== OBSERVATION_QUEUE_VERSION) {
+    // Queues created before queueVersion=2 closed over their original module's recordMemoryTurn and
+    // validateMemoryNamespace, so reusing them across an upgrade rejects new store handles forever.
+    retiredLegacyQueue = existingRuntime.queue;
+    existingRuntime.callbacks = { onRecorded() {}, onError() {} };
+    observationRuntime = {
+      callbacks: observationCallbacks,
+      recordTurn: recordMemoryTurn,
+      isLockedError: isMemoryStoreLockedError,
+      retiringQueueClose: existingRuntime.retiringQueueClose,
+      nextGlobalDreamCheckAt: existingRuntime.nextGlobalDreamCheckAt,
+      lastMergeCheckedDir: existingRuntime.lastMergeCheckedDir,
+      nextMergeCheckAt: existingRuntime.nextMergeCheckAt,
+      lastNoDreamMergeNotice: existingRuntime.lastNoDreamMergeNotice,
+      statusControllers: existingRuntime.statusControllers,
+      pendingNotifications: existingRuntime.pendingNotifications,
+    };
+    for (const slot of ["launch", "globalLaunch", "mergeLaunch"] as const) {
+      const pendingLaunch = existingRuntime[slot];
+      if (!pendingLaunch) continue;
+      observationRuntime[slot] = pendingLaunch;
+      void pendingLaunch.finally(() => {
+        if (observationRuntime[slot] === pendingLaunch) observationRuntime[slot] = undefined;
+      });
+    }
+    existingRuntime.notify = (notification) => observationRuntime.notify?.(notification);
+    observationRuntimeRegistry[observationRuntimeKey] = observationRuntime;
+  } else {
+    observationRuntime = existingRuntime ?? { callbacks: observationCallbacks };
+    observationRuntimeRegistry[observationRuntimeKey] = observationRuntime;
+    observationRuntime.callbacks = observationCallbacks;
+    observationRuntime.recordTurn = recordMemoryTurn;
+    observationRuntime.isLockedError = isMemoryStoreLockedError;
+  }
   observationRuntime.notify = (notification) => {
     if (!observationContext) {
       (observationRuntime.pendingNotifications ??= []).push(notification);
@@ -259,7 +302,28 @@ export default function piMemoryExtension(
   const observations = observationRuntime.queue ??= observationQueueFactory({
     onRecorded: (handle, turn, snapshot) => observationRuntime.callbacks.onRecorded(handle, turn, snapshot),
     onError: (handle, error) => observationRuntime.callbacks.onError(handle, error),
+  }, {
+    recordTurn: (handle, turn, signal) => (observationRuntime.recordTurn ?? recordMemoryTurn)(handle, turn, signal),
+    isLockedError: (error): error is MemoryStoreLockedError => (observationRuntime.isLockedError ?? isMemoryStoreLockedError)(error),
   });
+  observationRuntime.queueVersion = OBSERVATION_QUEUE_VERSION;
+  if (retiredLegacyQueue) {
+    const retireClose = retiredLegacyQueue.close().then((remaining) => {
+      if (remaining > 0) {
+        observationRuntime.notify?.({
+          state: "unavailable",
+          type: "warning",
+          message: `Memory retired a pre-upgrade observation queue with ${remaining} unsaved user-message observation(s); new observations use the reloaded runtime.`,
+        });
+      }
+    }, () => {});
+    const previousRetiring = observationRuntime.retiringQueueClose;
+    const combinedRetiring = previousRetiring ? Promise.all([previousRetiring, retireClose]).then(() => {}) : retireClose;
+    observationRuntime.retiringQueueClose = combinedRetiring;
+    void combinedRetiring.finally(() => {
+      if (observationRuntime.retiringQueueClose === combinedRetiring) observationRuntime.retiringQueueClose = undefined;
+    });
+  }
   const resetObservationContext = () => {
     sessionGeneration++;
     latestObservation = undefined;
@@ -300,6 +364,7 @@ export default function piMemoryExtension(
     }
     for (const controller of observationRuntime.statusControllers ?? []) controller.abort();
     observationRuntime.statusControllers?.clear();
+    await observationRuntime.retiringQueueClose;
     const pending = await observations.close();
     if (observationRuntimeRegistry[observationRuntimeKey] === observationRuntime) {
       delete observationRuntimeRegistry[observationRuntimeKey];
